@@ -813,7 +813,7 @@ createServer(async (req, res) => {
       json(res, { error: "Server error. Check input and try again." }, 500);
     else res.end();
   }
-}).listen(Number(process.env.PORT || 8000), "127.0.0.1", () =>
+}).listen(Number(process.env.PORT || 8000), "0.0.0.0", () =>
   console.log(
     `Escape Villa ready at http://0.0.0.0:${process.env.PORT || 8000}`,
   ),
