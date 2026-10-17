@@ -34,8 +34,21 @@ function renderAbout(): void {
   app!.innerHTML = page('About Escape Villa', 'Female-owned. Established in 2024. Based in Polokwane Central, South Africa.', `<div class="facts"><div><small>OWNER</small><b>Maano Makhode</b></div><div><small>INDUSTRY</small><b>Photography & Event Services</b></div><div><small>ADDRESS</small><b>38 Voortrekker Street, Polokwane Central</b></div></div><h2 class="serif">Our story</h2><p class="copy">Established in 2024, Escape Villa brings photography, videography, event planning and makeup services together under one creative brand. The business focuses on capturing meaningful moments, supporting memorable occasions and continuously improving the service experience for its clients.</p><div class="two-col"><div><h2 class="serif">Our mission</h2><p class="copy">Our mission is to provide high-quality photography and event services that capture meaningful moments, create memorable experiences and deliver value to our clients.</p></div><div><h2 class="serif">Our vision</h2><p class="copy">Our vision is to grow into a trusted and recognised creative services brand known for quality, professionalism, creativity and positive customer experiences.</p></div></div><h2 class="serif">Our goals</h2><ul class="copy"><li>Provide high-quality creative and event services.</li><li>Create memorable experiences for clients.</li><li>Build strong and positive client relationships.</li><li>Grow and strengthen the Escape Villa brand.</li><li>Continuously improve service quality.</li><li>Expand the company’s reach and customer base.</li></ul><h2 class="serif">Meet the owner</h2><p class="copy">Maano Makhode is the owner of Escape Villa. An owner-approved portrait and biography can be added through the administrator portal.</p>`);
 }
 function renderGallery(): void {
-  const photos = ['photo-1519741497674-611481863552', 'photo-1537633552985-df8429e8048b', 'photo-1519167758481-83f550bb49b3', 'photo-1492619375914-88005aa9e8fb', 'photo-1487412720507-e7ab37603c6f', 'photo-1511285560929-80b456fea0bc'];
-  app!.innerHTML = page('Gallery', 'Licensed illustrative stock imagery. These are not Escape Villa client photographs.', `<div class="gallery">${photos.map((photo) => `<img alt="Licensed illustrative event imagery" src="https://images.unsplash.com/${photo}?auto=format&fit=crop&w=1000&q=80">`).join('')}</div>`);
+  const photos = [
+    ['01-maternity-holiday.jpeg', 'Maternity holiday portrait'],
+    ['02-white-interior.jpeg', 'White villa interior'],
+    ['03-family-portrait.jpeg', 'Family portrait'],
+    ['04-arched-interior.jpeg', 'Arched villa interior'],
+    ['05-portrait-session.jpeg', 'Portrait session'],
+    ['06-villa-patio.jpeg', 'Villa patio and event setup'],
+    ['07-family-maternity.jpeg', 'Family maternity portrait'],
+    ['08-event-table.jpeg', 'Event table setting'],
+    ['09-maternity-red.jpeg', 'Maternity portrait'],
+    ['10-pool-event-setup.jpeg', 'Poolside event setup'],
+    ['11-dining-decoration.jpeg', 'Dining table decoration'],
+    ['12-graduation-portrait.jpeg', 'Graduation portrait'],
+  ];
+  app!.innerHTML = page('Gallery', 'A selection of Escape Villa photography and event work.', `<div class="gallery">${photos.map(([photo, description]) => `<img alt="${description}" loading="lazy" src="/images/gallery/${photo}">`).join('')}</div>`);
 }
 function renderContact(): void {
   app!.innerHTML = page('Contact', 'Tell us about your plans. We will reply using the details you provide.', `<div class="two-col"><div><h2 class="serif">Visit Escape Villa</h2><p class="copy">38 Voortrekker Street<br>Polokwane Central, South Africa</p><p class="muted">Phone, email, WhatsApp and Instagram details will appear here once configured by the owner.</p></div><form data-form="contact" class="form"><label>Full name<input name="name" required></label><label>Email<input name="email" type="email" required></label><label>Contact number<input name="phone" required></label><label>Subject<input name="subject" required></label><label>Message<textarea name="message" required></textarea></label><button class="button">Send enquiry</button></form></div>`);
