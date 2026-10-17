@@ -16,6 +16,8 @@ This project now uses TypeScript for both the browser application (`app.ts`) and
 
 4. Open http://127.0.0.1:8000 and go to `/admin/setup` to create the first administrator. Customers can register at `/register`.
 
+If the browser-based one-time setup key is unavailable, stop the server and run `npm run setup:admin` in this folder. It builds the app and prompts locally for the first administrator's name, email, and password. Then restart the server and sign in at `/admin/login`.
+
 `npm run build` compiles TypeScript into `dist/`. SQLite data is stored in `dist/data/escape-villa.sqlite3` by default. Set `DATABASE_PATH` to choose a persistent location for deployment. Keep `ESCAPE_VILLA_SETUP_KEY` private; administrator setup becomes unavailable after the first admin exists.
 
 ## Current implementation scope

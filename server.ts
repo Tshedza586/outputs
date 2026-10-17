@@ -46,14 +46,21 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 const initialServices = [
   [
     "Photography",
-    "Photography for the people, details and moments you want to remember.",
+    "Professional maternity, birthday, graduation, corporate and brand photography shoots.",
   ],
   [
     "Videography",
-    "Moving images to preserve the feeling and story of an occasion.",
+    "Film and video shoots for occasions, brands and creative projects.",
   ],
-  ["Event Planning", "Planning support to help shape a memorable gathering."],
-  ["Makeup", "Makeup appointments for your occasion, confirmed with the team."],
+  [
+    "Event Planning",
+    "Greek-inspired outdoor venue hire, décor and catering for baby showers, birthdays, graduation parties and year-end functions. Maximum 45 guests; rates depend on guest numbers.",
+  ],
+  ["Makeup", "Makeup, hair installation and styling by appointment."],
+  [
+    "Romantic Private Dinner",
+    "A romantic private-dining setup with a three-course meal, arranged by appointment.",
+  ],
 ];
 for (const [name, description] of initialServices)
   database
@@ -61,6 +68,10 @@ for (const [name, description] of initialServices)
       "INSERT OR IGNORE INTO services(name,description,required_skill) VALUES(?,?,?)",
     )
     .run(name, description, name);
+for (const [name, description] of initialServices)
+  database
+    .prepare("UPDATE services SET description=? WHERE name=?")
+    .run(description, name);
 database
   .prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)")
   .run(
@@ -422,6 +433,62 @@ async function handleApi(
       notify(admin.id, "A new contact enquiry has arrived.");
     return (json(res, { ok: true }), true);
   }
+  if (method === "PATCH" && path === "/api/customer/profile") {
+    const user = requireRole(req, res, ["customer"]);
+    if (!user) return true;
+    const body = await readJson(req);
+    const name = String(body.name || "").trim();
+    const email = String(body.email || "").trim().toLowerCase();
+    const phone = String(body.phone || "").trim();
+    const currentPassword = String(body.current_password || "");
+    const newPassword = String(body.new_password || "");
+    if (!name || !/^\S+@\S+\.\S+$/.test(email))
+      return (
+        json(res, { error: "Enter your name and a valid email address." }, 400),
+        true
+      );
+    const duplicate = database
+      .prepare("SELECT 1 FROM users WHERE email=? AND id<>?")
+      .get(email, user.id);
+    if (duplicate)
+      return (
+        json(res, { error: "That email address is already registered." }, 409),
+        true
+      );
+    if (newPassword) {
+      const saved = database
+        .prepare("SELECT password_hash FROM users WHERE id=?")
+        .get(user.id) as { password_hash: string } | undefined;
+      if (!saved || !verifyPassword(currentPassword, saved.password_hash))
+        return (
+          json(res, { error: "Your current password is incorrect." }, 401),
+          true
+        );
+      if (newPassword.length < 10)
+        return (
+          json(res, { error: "Your new password must be at least 10 characters." }, 400),
+          true
+        );
+    }
+    try {
+      database
+        .prepare("UPDATE users SET name=?,email=?,phone=? WHERE id=?")
+        .run(name, email, phone, user.id);
+      if (newPassword)
+        database
+          .prepare("UPDATE users SET password_hash=? WHERE id=?")
+          .run(hashPassword(newPassword), user.id);
+    } catch {
+      return (
+        json(res, { error: "That email address is already registered." }, 409),
+        true
+      );
+    }
+    const updated = database
+      .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
+      .get(user.id) as SessionUser;
+    return (json(res, updated), true);
+  }
   if (method === "GET" && path === "/api/customer/bookings") {
     const user = requireRole(req, res, ["customer"]);
     if (!user) return true;
@@ -449,6 +516,18 @@ async function handleApi(
       Math.min(960, Number(body.duration_minutes) || 60),
     );
     const service = Number(body.service_id);
+    const guestCount =
+      body.guests === undefined || body.guests === null || body.guests === ""
+        ? null
+        : Number(body.guests);
+    if (
+      guestCount !== null &&
+      (!Number.isInteger(guestCount) || guestCount < 1 || guestCount > 45)
+    )
+      return (
+        json(res, { error: "Escape Villa can accommodate up to 45 guests." }, 400),
+        true
+      );
     if (
       !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
       date < new Date().toISOString().slice(0, 10) ||
@@ -499,7 +578,7 @@ async function handleApi(
         time,
         minutes,
         venue,
-        Number(body.guests) || null,
+        guestCount,
         String(body.details || ""),
         now(),
       );
@@ -524,6 +603,49 @@ async function handleApi(
       )
       .all();
     return (json(res, { bookings, staff }), true);
+  }
+  if (method === "POST" && path === "/api/admin/staff") {
+    if (!requireRole(req, res, ["admin"])) return true;
+    const body = await readJson(req);
+    const name = String(body.name || "").trim();
+    const email = String(body.email || "").trim().toLowerCase();
+    const phone = String(body.phone || "").trim();
+    const skills = String(body.skills || "").trim().slice(0, 500);
+    const password = String(body.password || "");
+    if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10)
+      return (
+        json(
+          res,
+          { error: "Enter a name, valid email and password of at least 10 characters." },
+          400,
+        ),
+        true
+      );
+    try {
+      database.exec("BEGIN IMMEDIATE");
+      const result = database
+        .prepare(
+          "INSERT INTO users(name,email,phone,password_hash,role,created_at) VALUES(?,?,?,?,'staff',?)",
+        )
+        .run(name, email, phone, hashPassword(password), now());
+      database
+        .prepare("INSERT INTO staff(user_id,skills) VALUES(?,?)")
+        .run(Number(result.lastInsertRowid), skills);
+      database.exec("COMMIT");
+      const staffUser = database
+        .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
+        .get(Number(result.lastInsertRowid)) as SessionUser;
+      return (json(res, staffUser, 201), true);
+    } catch (error) {
+      database.exec("ROLLBACK");
+      if (String(error).includes("UNIQUE constraint failed: users.email"))
+        return (
+          json(res, { error: "That email address is already registered." }, 409),
+          true
+        );
+      console.error(error);
+      return (json(res, { error: "Could not create the staff account." }, 500), true);
+    }
   }
   if (method === "GET" && path === "/api/admin/reports") {
     if (!requireRole(req, res, ["admin"])) return true;
