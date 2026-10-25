@@ -87,9 +87,10 @@ database
     "Our vision is to grow into a trusted and recognised creative services brand known for quality, professionalism, creativity and positive customer experiences.",
   );
 
-const secret =
-  process.env.ESCAPE_VILLA_SECRET ||
-  "development-secret-change-before-deployment";
+const storedSessionSecret = database
+  .prepare("SELECT value FROM settings WHERE key='session_secret_override'")
+  .get() as { value: string } | undefined;
+let secret = storedSessionSecret?.value || process.env.ESCAPE_VILLA_SECRET || "development-secret-change-before-deployment";
 const now = (): string => new Date().toISOString();
 function logActivity(actor: SessionUser | null, action: string, entity: string, entityId = "", details = ""): void {
   database.prepare("INSERT INTO activity_log(actor_id,actor_name,actor_role,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?,?,?)")
@@ -357,6 +358,62 @@ async function handleApi(
     login(req, res, user);
     return true;
   }
+  if (method === "POST" && path === "/api/admin/recover") {
+    const body = await readJson(req);
+    const configured = process.env.ESCAPE_VILLA_ADMIN_RECOVERY_KEY || "";
+    const provided = String(body.recovery_key || "");
+    const configuredBytes = Buffer.from(configured);
+    const providedBytes = Buffer.from(provided);
+    if (configuredBytes.length < 32 || configuredBytes.length !== providedBytes.length || !timingSafeEqual(configuredBytes, providedBytes))
+      return (json(res, { error: "Recovery is unavailable or the recovery key is incorrect." }, 403), true);
+    const name = String(body.name || "").trim();
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10)
+      return (json(res, { error: "Enter a name, valid email and password of at least 10 characters." }, 400), true);
+    const admins = database.prepare("SELECT id FROM users WHERE role='admin'").all() as Array<{ id: number }>;
+    if (admins.length !== 1)
+      return (json(res, { error: admins.length === 0 ? "No administrator account exists. Use the initial setup page instead." : "There is more than one administrator account. Ask an existing administrator to update the account." }, 409), true);
+    const adminId = admins[0].id;
+    const duplicate = database.prepare("SELECT 1 FROM users WHERE email=? AND id<>?").get(email, adminId);
+    if (duplicate)
+      return (json(res, { error: "That email address is already registered." }, 409), true);
+    database.prepare("UPDATE users SET name=?,email=?,password_hash=? WHERE id=?")
+      .run(name, email, hashPassword(password), adminId);
+    const admin = database.prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
+      .get(adminId) as SessionUser;
+    logActivity(admin, "Recovered administrator login details", "Account", String(admin.id));
+    process.env.ESCAPE_VILLA_ADMIN_RECOVERY_KEY = "";
+    login(req, res, admin);
+    return true;
+  }
+  if (method === "POST" && path === "/api/admin/reset-all") {
+    const body = await readJson(req);
+    const configured = process.env.ESCAPE_VILLA_RESET_ALL_KEY || "";
+    const provided = String(body.reset_key || "");
+    const configuredBytes = Buffer.from(configured);
+    const providedBytes = Buffer.from(provided);
+    if (configuredBytes.length < 32 || configuredBytes.length !== providedBytes.length || !timingSafeEqual(configuredBytes, providedBytes))
+      return (json(res, { error: "Reset is unavailable or the reset key is incorrect." }, 403), true);
+    if (body.confirmation !== "ERASE ALL ACCOUNTS")
+      return (json(res, { error: "Type ERASE ALL ACCOUNTS exactly to continue." }, 400), true);
+    if (!process.env.ESCAPE_VILLA_SETUP_KEY)
+      return (json(res, { error: "Configure ESCAPE_VILLA_SETUP_KEY before erasing accounts, so a new administrator can be created afterward." }, 503), true);
+    try {
+      database.exec("BEGIN IMMEDIATE");
+      database.exec("DELETE FROM notifications; DELETE FROM changes; DELETE FROM tasks; DELETE FROM payments; DELETE FROM bookings; DELETE FROM staff; DELETE FROM users; DELETE FROM activity_log;");
+      const newSessionSecret = randomBytes(32).toString("hex");
+      database.prepare("INSERT INTO settings(key,value) VALUES('session_secret_override',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(newSessionSecret);
+      database.exec("COMMIT");
+      secret = newSessionSecret;
+      process.env.ESCAPE_VILLA_RESET_ALL_KEY = "";
+    } catch {
+      try { database.exec("ROLLBACK"); } catch { /* transaction may already be closed */ }
+      return (json(res, { error: "The reset could not be completed. No partial reset was kept." }, 500), true);
+    }
+    res.setHeader("Set-Cookie", "ev_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    return (json(res, { ok: true, message: "Accounts and linked business data were erased. Create the new administrator at /admin/setup." }), true);
+  }
   if (method === "POST" && path === "/api/admin/setup") {
     const body = await readJson(req);
     const configured = process.env.ESCAPE_VILLA_SETUP_KEY;
@@ -441,6 +498,44 @@ async function handleApi(
       .all() as Array<{ id: number }>)
       notify(admin.id, "A new contact enquiry has arrived.");
     return (json(res, { ok: true }), true);
+  }
+  if (method === "PATCH" && path === "/api/admin/account") {
+    const user = requireRole(req, res, ["admin"]);
+    if (!user) return true;
+    const body = await readJson(req);
+    const name = String(body.name || "").trim();
+    const email = String(body.email || "").trim().toLowerCase();
+    const currentPassword = String(body.current_password || "");
+    const newPassword = String(body.new_password || "");
+    if (!name || !/^\S+@\S+\.\S+$/.test(email))
+      return (json(res, { error: "Enter your name and a valid email address." }, 400), true);
+    const saved = database
+      .prepare("SELECT password_hash FROM users WHERE id=?")
+      .get(user.id) as { password_hash: string } | undefined;
+    if (!saved || !verifyPassword(currentPassword, saved.password_hash))
+      return (json(res, { error: "Your current password is incorrect." }, 401), true);
+    if (newPassword && newPassword.length < 10)
+      return (json(res, { error: "Your new password must be at least 10 characters." }, 400), true);
+    const duplicate = database
+      .prepare("SELECT 1 FROM users WHERE email=? AND id<>?")
+      .get(email, user.id);
+    if (duplicate)
+      return (json(res, { error: "That email address is already registered." }, 409), true);
+    try {
+      database.prepare("UPDATE users SET name=?,email=? WHERE id=?").run(name, email, user.id);
+      if (newPassword)
+        database.prepare("UPDATE users SET password_hash=? WHERE id=?").run(hashPassword(newPassword), user.id);
+    } catch {
+      return (json(res, { error: "That email address is already registered." }, 409), true);
+    }
+    const updated = database
+      .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
+      .get(user.id) as SessionUser;
+    const changes = [email !== user.email ? "email changed" : "", newPassword ? "password changed" : ""]
+      .filter(Boolean)
+      .join("; ") || "name updated";
+    logActivity(updated, "Updated administrator login details", "Account", String(user.id), changes);
+    return (json(res, updated), true);
   }
   if (method === "PATCH" && path === "/api/customer/profile") {
     const user = requireRole(req, res, ["customer"]);

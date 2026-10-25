@@ -18,6 +18,10 @@ This project now uses TypeScript for both the browser application (`app.ts`) and
 
 If the browser-based one-time setup key is unavailable, stop the server and run `npm run setup:admin` in this folder. It builds the app and prompts locally for the first administrator's name, email, and password. Then restart the server and sign in at `/admin/login`.
 
+To recover a forgotten administrator login when exactly one admin account exists, set a private `ESCAPE_VILLA_ADMIN_RECOVERY_KEY` of at least 32 characters in the hosting environment and redeploy. Open `/admin/recover`, enter that key and the replacement name, email, and password. Remove the recovery key from the hosting environment as soon as recovery is complete. The admin dashboard also includes settings for later email and password changes; those require the current password.
+
+For a full account reset, configure both `ESCAPE_VILLA_SETUP_KEY` and a private `ESCAPE_VILLA_RESET_ALL_KEY` (at least 32 characters) in the hosting environment, then redeploy. Visit `/admin/reset-all`, enter the reset key and type `ERASE ALL ACCOUNTS`. This removes all users, bookings, payment records, staff assignments and tasks, booking changes, notifications, and activity history. It retains services, site settings, and contact enquiries. Create the new administrator at `/admin/setup`, then remove `ESCAPE_VILLA_RESET_ALL_KEY` from the hosting environment. The reset rotates the session signing secret to invalidate existing login cookies.
+
 `npm run build` compiles TypeScript into `dist/`. SQLite data is stored in `dist/data/escape-villa.sqlite3` by default. Set `DATABASE_PATH` to choose a persistent location for deployment. Keep `ESCAPE_VILLA_SETUP_KEY` private; administrator setup becomes unavailable after the first admin exists.
 
 ## Current implementation scope
