@@ -34,7 +34,8 @@ database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
 database.exec(`
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, phone TEXT, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('customer','admin','staff')), active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS services(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT NOT NULL, required_skill TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS bookings(id INTEGER PRIMARY KEY, reference TEXT UNIQUE NOT NULL, customer_id INTEGER NOT NULL REFERENCES users(id), service_id INTEGER NOT NULL REFERENCES services(id), event_type TEXT NOT NULL DEFAULT '', event_date TEXT NOT NULL, start_time TEXT NOT NULL, duration_minutes INTEGER NOT NULL DEFAULT 60, venue TEXT NOT NULL, guests INTEGER, details TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Pending Payment', created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS packages(id INTEGER PRIMARY KEY, service_id INTEGER NOT NULL REFERENCES services(id), name TEXT NOT NULL, price REAL NOT NULL, price_from INTEGER NOT NULL DEFAULT 0, duration_minutes INTEGER, description TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, UNIQUE(service_id,name));
+CREATE TABLE IF NOT EXISTS bookings(id INTEGER PRIMARY KEY, reference TEXT UNIQUE NOT NULL, customer_id INTEGER NOT NULL REFERENCES users(id), service_id INTEGER NOT NULL REFERENCES services(id), package_id INTEGER REFERENCES packages(id), package_name TEXT NOT NULL DEFAULT '', package_price REAL, package_price_from INTEGER NOT NULL DEFAULT 0, package_description TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL DEFAULT '', event_date TEXT NOT NULL, start_time TEXT NOT NULL, duration_minutes INTEGER NOT NULL DEFAULT 60, venue TEXT NOT NULL, guests INTEGER, details TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Pending Payment', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, booking_id INTEGER UNIQUE NOT NULL REFERENCES bookings(id), amount REAL, status TEXT NOT NULL DEFAULT 'Pending', evidence_received INTEGER NOT NULL DEFAULT 0, rejection_reason TEXT, reviewed_at TEXT);
 CREATE TABLE IF NOT EXISTS staff(id INTEGER PRIMARY KEY, user_id INTEGER UNIQUE NOT NULL REFERENCES users(id), skills TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, booking_id INTEGER NOT NULL REFERENCES bookings(id), staff_id INTEGER REFERENCES staff(id), name TEXT NOT NULL, required_skill TEXT NOT NULL, due_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Unassigned', notes TEXT NOT NULL DEFAULT '', UNIQUE(booking_id,name));
@@ -45,6 +46,18 @@ CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY, actor_id INTEGER
 CREATE INDEX IF NOT EXISTS activity_log_created_idx ON activity_log(created_at DESC);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 `);
+const bookingColumns = new Set(
+  (database.prepare("PRAGMA table_info(bookings)").all() as Array<{ name: string }>).map((column) => column.name),
+);
+for (const [name, declaration] of [
+  ["package_id", "INTEGER REFERENCES packages(id)"],
+  ["package_name", "TEXT NOT NULL DEFAULT ''"],
+  ["package_price", "REAL"],
+  ["package_price_from", "INTEGER NOT NULL DEFAULT 0"],
+  ["package_description", "TEXT NOT NULL DEFAULT ''"],
+] as const) {
+  if (!bookingColumns.has(name)) database.exec(`ALTER TABLE bookings ADD COLUMN ${name} ${declaration}`);
+}
 const initialServices = [
   [
     "Photography",
@@ -74,6 +87,28 @@ for (const [name, description] of initialServices)
   database
     .prepare("UPDATE services SET description=? WHERE name=?")
     .run(description, name);
+const initialPackages: Array<[string, string, number, boolean, number | null, string]> = [
+  ["Photography", "Basic Moments", 850, false, 60, "Up to 1 hour|1 photography session|10 edited digital photos|1 location|Online digital delivery"],
+  ["Photography", "Classic Memories", 1500, false, 120, "Up to 2 hours|1 photography session|25 edited digital photos|Up to 2 outfit changes|1 location"],
+  ["Photography", "Premium Moments", 3500, false, 240, "Up to 4 hours|Event photography coverage|At least 100 edited photos|Candid and group photos|Digital gallery delivery"],
+  ["Videography", "Mini Moments", 1200, false, 60, "Up to 1 hour of filming|30–60 second highlight video|Basic editing|Social-media-ready format"],
+  ["Videography", "Signature Film", 2500, false, 180, "Up to 3 hours of filming|2–3 minute highlight video|Music and colour editing|Digital delivery"],
+  ["Videography", "Premium Cinema", 4500, false, 300, "Up to 5 hours of filming|4–6 minute highlight film|30–60 second social media reel|Professional editing"],
+  ["Event Planning", "Essential Planning", 1500, false, null, "Initial planning consultation|Event theme and concept|Basic event checklist|Budget planning assistance"],
+  ["Event Planning", "Signature Celebration", 3500, false, null, "Event planning and coordination|Theme and décor planning|Supplier coordination|Event-day schedule"],
+  ["Event Planning", "Luxury Events", 7500, true, null, "Detailed event planning|Venue and supplier coordination|Décor and setup coordination|Event-day management"],
+  ["Makeup", "Soft Glam", 450, false, 60, "Natural, soft glam makeup|Skin preparation|Lashes included|Suitable for photoshoots and daytime events"],
+  ["Makeup", "Full Glam", 650, false, 90, "Full glam makeup application|Contour and highlight|Lashes included|Suitable for parties and special occasions"],
+  ["Makeup", "Bridal Glam", 1200, false, 120, "Bridal makeup application|Skin preparation and lashes|Long-wear makeup finish|Brief consultation before the event"],
+  ["Romantic Private Dinner", "Love in Simplicity", 1200, false, 180, "For 2 people|Romantic table setup|Candles and rose-petal styling|Personalized table message|Basic photo-taking area"],
+  ["Romantic Private Dinner", "Romance Experience", 2000, false, 180, "For 2 people|Enhanced romantic décor|Floral table centerpiece|Personalized message|Dinner arrangement coordination|Photos of the setup"],
+  ["Romantic Private Dinner", "Luxury Love Affair", 3500, false, 180, "For 2 people|Premium romantic table styling|Flowers and candle décor|Personalized celebration setup|Dinner and venue coordination|Photography session of the couple"],
+];
+const packageStatement = database.prepare(
+  "INSERT INTO packages(service_id,name,price,price_from,duration_minutes,description) SELECT id,?,?,?,?,? FROM services WHERE name=? ON CONFLICT(service_id,name) DO UPDATE SET price=excluded.price,price_from=excluded.price_from,duration_minutes=excluded.duration_minutes,description=excluded.description,active=1",
+);
+for (const [serviceName, name, price, priceFrom, durationMinutes, description] of initialPackages)
+  packageStatement.run(name, price, priceFrom ? 1 : 0, durationMinutes, description, serviceName);
 database
   .prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)")
   .run(
@@ -273,15 +308,10 @@ async function handleApi(
         "SELECT id,name,description,required_skill FROM services WHERE active=1 ORDER BY id",
       )
       .all();
-    const settings = Object.fromEntries(
-      (
-        database.prepare("SELECT key,value FROM settings").all() as Array<{
-          key: string;
-          value: string;
-        }>
-      ).map((row) => [row.key, row.value]),
-    );
-    return (json(res, { services: serviceRows, settings }), true);
+    const packageRows = database
+      .prepare("SELECT p.id,p.service_id,s.name AS service_name,p.name,p.price,p.price_from,p.duration_minutes,p.description FROM packages p JOIN services s ON s.id=p.service_id WHERE p.active=1 AND s.active=1 ORDER BY s.id,p.id")
+      .all();
+    return (json(res, { services: serviceRows, packages: packageRows }), true);
   }
   if (method === "POST" && path === "/api/register") {
     const body = await readJson(req);
@@ -615,12 +645,18 @@ async function handleApi(
     const body = await readJson(req);
     const date = String(body.event_date || "");
     const time = String(body.start_time || "");
-    const venue = String(body.venue || "").trim();
+    const venue = "Escape Villa, 38 Voortrekker Street, Polokwane Central";
+    const packageId = Number(body.package_id);
+    const selectedPackage = database
+      .prepare("SELECT p.id,p.service_id,p.name,p.price,p.price_from,p.duration_minutes,p.description,s.required_skill FROM packages p JOIN services s ON s.id=p.service_id WHERE p.id=? AND p.active=1 AND s.active=1")
+      .get(packageId) as { id: number; service_id: number; name: string; price: number; price_from: number; duration_minutes: number | null; description: string; required_skill: string } | undefined;
+    if (!selectedPackage)
+      return (json(res, { error: "Choose an available package." }, 400), true);
     const minutes = Math.max(
       30,
-      Math.min(960, Number(body.duration_minutes) || 60),
+      Math.min(960, Number(body.duration_minutes) || selectedPackage.duration_minutes || 60),
     );
-    const service = Number(body.service_id);
+    const service = selectedPackage.service_id;
     const guestCount =
       body.guests === undefined || body.guests === null || body.guests === ""
         ? null
@@ -636,22 +672,16 @@ async function handleApi(
     if (
       !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
       date < new Date().toISOString().slice(0, 10) ||
-      !/^\d{2}:\d{2}$/.test(time) ||
-      !venue
+      !/^\d{2}:\d{2}$/.test(time)
     )
       return (
         json(
           res,
-          { error: "Choose a future date, valid time and venue." },
+          { error: "Choose a future date and valid time." },
           400,
         ),
         true
       );
-    const selected = database
-      .prepare("SELECT id FROM services WHERE id=? AND active=1")
-      .get(service);
-    if (!selected)
-      return (json(res, { error: "Choose an active service." }, 400), true);
     const end = new Date(`2000-01-01T${time}:00`);
     end.setMinutes(end.getMinutes() + minutes);
     const endText = `${String(end.getHours()).padStart(2, "0")}:${String(end.getMinutes()).padStart(2, "0")}`;
@@ -672,12 +702,17 @@ async function handleApi(
     const reference = `EV-${new Date().toISOString().slice(2, 10).replaceAll("-", "")}-${randomBytes(3).toString("hex").toUpperCase()}`;
     const result = database
       .prepare(
-        "INSERT INTO bookings(reference,customer_id,service_id,event_type,event_date,start_time,duration_minutes,venue,guests,details,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'Pending Payment',?)",
+        "INSERT INTO bookings(reference,customer_id,service_id,package_id,package_name,package_price,package_price_from,package_description,event_type,event_date,start_time,duration_minutes,venue,guests,details,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending Payment',?)",
       )
       .run(
         reference,
         user.id,
         service,
+        selectedPackage.id,
+        selectedPackage.name,
+        selectedPackage.price,
+        selectedPackage.price_from,
+        selectedPackage.description,
         String(body.event_type || ""),
         date,
         time,
@@ -690,7 +725,7 @@ async function handleApi(
     database
       .prepare("INSERT INTO payments(booking_id,status) VALUES(?,'Pending')")
       .run(Number(result.lastInsertRowid));
-    logActivity(user, "Requested appointment", "Booking", reference, `${date} ${time}; service ${service}`);
+    logActivity(user, "Requested appointment", "Booking", reference, `${date} ${time}; ${selectedPackage.name} (R${selectedPackage.price}${selectedPackage.price_from ? "+" : ""})`);
     return (
       json(res, { ok: true, reference, status: "Pending Payment" }, 201),
       true
@@ -797,7 +832,7 @@ async function handleApi(
     const until = endDate.toISOString().slice(0, 10);
     const bookings = database
       .prepare(
-        "SELECT b.reference,b.event_date,b.start_time,b.event_type,b.venue,b.status,u.name AS customer,u.email,s.name AS service,p.status AS payment_status,p.amount AS paid_amount FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id WHERE b.event_date>=? AND b.event_date<? ORDER BY b.event_date,b.start_time",
+        "SELECT b.reference,b.event_date,b.start_time,b.event_type,b.venue,b.status,b.package_name,b.package_price,b.package_price_from,u.name AS customer,u.email,s.name AS service,p.status AS payment_status,p.amount AS paid_amount FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id WHERE b.event_date>=? AND b.event_date<? ORDER BY b.event_date,b.start_time",
       )
       .all(from, until) as Array<Record<string, string | number | null>>;
     const activity = database
