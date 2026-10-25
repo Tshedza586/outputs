@@ -22,7 +22,7 @@ To recover a forgotten administrator login when exactly one admin account exists
 
 For a full account reset, configure both `ESCAPE_VILLA_SETUP_KEY` and a private `ESCAPE_VILLA_RESET_ALL_KEY` (at least 32 characters) in the hosting environment, then redeploy. Visit `/admin/reset-all`, enter the reset key and type `ERASE ALL ACCOUNTS`. This removes all users, bookings, payment records, staff assignments and tasks, booking changes, notifications, and activity history. It retains services, site settings, and contact enquiries. Create the new administrator at `/admin/setup`, then remove `ESCAPE_VILLA_RESET_ALL_KEY` from the hosting environment. The reset rotates the session signing secret to invalidate existing login cookies.
 
-`npm run build` compiles TypeScript into `dist/`. SQLite data is stored in `dist/data/escape-villa.sqlite3` by default. Set `DATABASE_PATH` to choose a persistent location for deployment. Keep `ESCAPE_VILLA_SETUP_KEY` private; administrator setup becomes unavailable after the first admin exists.
+`npm run build` compiles TypeScript into `dist/`. For local development, the app uses SQLite at `dist/data/escape-villa.sqlite3` by default; set `DATABASE_PATH` to select another local file. For hosted deployments, set both `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to use a persistent Turso database. Set neither to use local SQLite. Do not commit or share the Turso token. Keep `ESCAPE_VILLA_SETUP_KEY` private; administrator setup becomes unavailable after the first admin exists.
 
 ## Current implementation scope
 

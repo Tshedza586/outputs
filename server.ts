@@ -9,7 +9,7 @@ import {
   timingSafeEqual,
   createHmac,
 } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { createClient } from "@libsql/client";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { extname, join, normalize, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,13 +25,32 @@ type SessionUser = {
 type JsonObject = Record<string, unknown>;
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(root, "public");
+const tursoUrl = process.env.TURSO_DATABASE_URL;
+const tursoToken = process.env.TURSO_AUTH_TOKEN;
+if (Boolean(tursoUrl) !== Boolean(tursoToken)) throw new Error("Set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN, or neither.");
 const dataDir = process.env.DATA_DIR || join(root, "data");
-mkdirSync(dataDir, { recursive: true });
-const database = new DatabaseSync(
-  process.env.DATABASE_PATH || join(dataDir, "escape-villa.sqlite3"),
-);
-database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
-database.exec(`
+if (!tursoUrl) mkdirSync(dataDir, { recursive: true });
+const client = createClient(tursoUrl && tursoToken ? { url: tursoUrl, authToken: tursoToken } : { url: `file:${process.env.DATABASE_PATH || join(dataDir, "escape-villa.sqlite3")}` });
+function makeDatabase(executor: any): any {
+  return {
+    exec: async (sql: string) => { await executor.executeMultiple(sql); },
+    prepare: (sql: string) => ({
+      run: async (...args: unknown[]) => executor.execute({ sql, args }),
+      get: async (...args: unknown[]) => (await executor.execute({ sql, args })).rows[0],
+      all: async (...args: unknown[]) => (await executor.execute({ sql, args })).rows,
+    }),
+    transaction: async (work: (tx: any) => Promise<any>) => {
+      const tx = await client.transaction("write");
+      try { const result = await work(makeDatabase(tx)); await tx.commit(); return result; }
+      catch (error) { await tx.rollback(); throw error; }
+    },
+  };
+}
+const database = makeDatabase(client);
+let secret = process.env.ESCAPE_VILLA_SECRET || "development-secret-change-before-deployment";
+async function initializeDatabase(): Promise<void> {
+if (!tursoUrl) await database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
+await database.exec(`
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, phone TEXT, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('customer','admin','staff')), active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS services(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT NOT NULL, required_skill TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS packages(id INTEGER PRIMARY KEY, service_id INTEGER NOT NULL REFERENCES services(id), name TEXT NOT NULL, price REAL NOT NULL, price_from INTEGER NOT NULL DEFAULT 0, duration_minutes INTEGER, description TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, UNIQUE(service_id,name));
@@ -47,7 +66,7 @@ CREATE INDEX IF NOT EXISTS activity_log_created_idx ON activity_log(created_at D
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 `);
 const bookingColumns = new Set(
-  (database.prepare("PRAGMA table_info(bookings)").all() as Array<{ name: string }>).map((column) => column.name),
+  (await database.prepare("PRAGMA table_info(bookings)").all()).map((column: any) => String(column.name)),
 );
 for (const [name, declaration] of [
   ["package_id", "INTEGER REFERENCES packages(id)"],
@@ -56,7 +75,7 @@ for (const [name, declaration] of [
   ["package_price_from", "INTEGER NOT NULL DEFAULT 0"],
   ["package_description", "TEXT NOT NULL DEFAULT ''"],
 ] as const) {
-  if (!bookingColumns.has(name)) database.exec(`ALTER TABLE bookings ADD COLUMN ${name} ${declaration}`);
+  if (!bookingColumns.has(name)) await database.exec(`ALTER TABLE bookings ADD COLUMN ${name} ${declaration}`);
 }
 const initialServices = [
   [
@@ -78,13 +97,13 @@ const initialServices = [
   ],
 ];
 for (const [name, description] of initialServices)
-  database
+  await database
     .prepare(
       "INSERT OR IGNORE INTO services(name,description,required_skill) VALUES(?,?,?)",
     )
     .run(name, description, name);
 for (const [name, description] of initialServices)
-  database
+  await database
     .prepare("UPDATE services SET description=? WHERE name=?")
     .run(description, name);
 const initialPackages: Array<[string, string, number, boolean, number | null, string]> = [
@@ -104,193 +123,90 @@ const initialPackages: Array<[string, string, number, boolean, number | null, st
   ["Romantic Private Dinner", "Romance Experience", 2000, false, 180, "For 2 people|Enhanced romantic décor|Floral table centerpiece|Personalized message|Dinner arrangement coordination|Photos of the setup"],
   ["Romantic Private Dinner", "Luxury Love Affair", 3500, false, 180, "For 2 people|Premium romantic table styling|Flowers and candle décor|Personalized celebration setup|Dinner and venue coordination|Photography session of the couple"],
 ];
-const packageStatement = database.prepare(
+const packageStatement = await database.prepare(
   "INSERT INTO packages(service_id,name,price,price_from,duration_minutes,description) SELECT id,?,?,?,?,? FROM services WHERE name=? ON CONFLICT(service_id,name) DO UPDATE SET price=excluded.price,price_from=excluded.price_from,duration_minutes=excluded.duration_minutes,description=excluded.description,active=1",
 );
 for (const [serviceName, name, price, priceFrom, durationMinutes, description] of initialPackages)
-  packageStatement.run(name, price, priceFrom ? 1 : 0, durationMinutes, description, serviceName);
-database
+  await packageStatement.run(name, price, priceFrom ? 1 : 0, durationMinutes, description, serviceName);
+await database
   .prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)")
   .run(
     "mission",
     "Our mission is to provide high-quality photography and event services that capture meaningful moments, create memorable experiences and deliver value to our clients.",
   );
-database
+await database
   .prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)")
   .run(
     "vision",
     "Our vision is to grow into a trusted and recognised creative services brand known for quality, professionalism, creativity and positive customer experiences.",
   );
 
-const storedSessionSecret = database
+const storedSessionSecret = await database
   .prepare("SELECT value FROM settings WHERE key='session_secret_override'")
   .get() as { value: string } | undefined;
-let secret = storedSessionSecret?.value || process.env.ESCAPE_VILLA_SECRET || "development-secret-change-before-deployment";
+secret = storedSessionSecret?.value || process.env.ESCAPE_VILLA_SECRET || "development-secret-change-before-deployment";
+}
+await initializeDatabase();
 const now = (): string => new Date().toISOString();
-function logActivity(actor: SessionUser | null, action: string, entity: string, entityId = "", details = ""): void {
-  database.prepare("INSERT INTO activity_log(actor_id,actor_name,actor_role,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?,?,?)")
+async function logActivity(actor: SessionUser | null, action: string, entity: string, entityId = "", details = ""): Promise<void> {
+  await database.prepare("INSERT INTO activity_log(actor_id,actor_name,actor_role,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?,?,?)")
     .run(actor?.id ?? null, actor?.name ?? "Visitor", actor?.role ?? "visitor", action, entity, entityId, details.slice(0, 500), now());
 }
 const json = (res: ServerResponse, body: unknown, status = 200): void => {
   const text = JSON.stringify(body);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
-    "Content-Length": Buffer.byteLength(text),
-    "X-Content-Type-Options": "nosniff",
-  });
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Content-Length": Buffer.byteLength(text), "X-Content-Type-Options": "nosniff" });
   res.end(text);
 };
 async function readJson(req: IncomingMessage): Promise<JsonObject> {
   let data = "";
-  for await (const chunk of req) {
-    data += chunk;
-    if (data.length > 1_000_000) throw new Error("Request body is too large.");
-  }
-  try {
-    return data ? (JSON.parse(data) as JsonObject) : {};
-  } catch {
-    throw new Error("Invalid JSON request.");
-  }
+  for await (const chunk of req) { data += chunk; if (data.length > 1_000_000) throw new Error("Request body is too large."); }
+  try { return data ? (JSON.parse(data) as JsonObject) : {}; } catch { throw new Error("Invalid JSON request."); }
 }
-const hashPassword = (password: string): string => {
-  const salt = randomBytes(16).toString("hex");
-  return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`;
-};
-const verifyPassword = (password: string, saved: string): boolean => {
-  const [salt, hash] = saved.split(":");
-  if (!salt || !hash) return false;
-  const actual = scryptSync(password, salt, 64);
-  const expected = Buffer.from(hash, "hex");
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-};
+const hashPassword = (password: string): string => { const salt = randomBytes(16).toString("hex"); return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`; };
+const verifyPassword = (password: string, saved: string): boolean => { const [salt, hash] = saved.split(":"); if (!salt || !hash) return false; const actual = scryptSync(password, salt, 64); const expected = Buffer.from(hash, "hex"); return actual.length === expected.length && timingSafeEqual(actual, expected); };
 function sessionCookie(userId: number): string {
-  const expiry = Math.floor(Date.now() / 1000) + 7 * 86400;
-  const data = `${userId}.${expiry}`;
+  const expiry = Math.floor(Date.now() / 1000) + 7 * 86400; const data = `${userId}.${expiry}`;
   const signature = createHmac("sha256", secret).update(data).digest("hex");
   return `ev_session=${data}.${signature}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV === "production" ? "; Secure" : ""}`;
 }
-function currentUser(req: IncomingMessage): SessionUser | null {
-  const cookie = req.headers.cookie
-    ?.split(";")
-    .map((part) => part.trim())
-    .find((part) => part.startsWith("ev_session="))
-    ?.slice("ev_session=".length);
+async function currentUser(req: IncomingMessage): Promise<SessionUser | null> {
+  const cookie = req.headers.cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith("ev_session="))?.slice("ev_session=".length);
   if (!cookie) return null;
   const [idText, expiry, signature] = cookie.split(".");
-  if (!idText || !expiry || !signature || Number(expiry) < Date.now() / 1000)
-    return null;
-  const expected = createHmac("sha256", secret)
-    .update(`${idText}.${expiry}`)
-    .digest("hex");
-  if (
-    signature.length !== expected.length ||
-    !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
-  )
-    return null;
-  return (
-    (database
-      .prepare(
-        "SELECT id,name,email,phone,role FROM users WHERE id=? AND active=1",
-      )
-      .get(Number(idText)) as SessionUser | undefined) || null
-  );
+  if (!idText || !expiry || !signature || Number(expiry) < Date.now() / 1000) return null;
+  const expected = createHmac("sha256", secret).update(`${idText}.${expiry}`).digest("hex");
+  if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+  return await database.prepare("SELECT id,name,email,phone,role FROM users WHERE id=? AND active=1").get(Number(idText)) as SessionUser | undefined || null;
 }
-function requireRole(
-  req: IncomingMessage,
-  res: ServerResponse,
-  roles: Role[],
-): SessionUser | null {
-  const user = currentUser(req);
-  if (!user) {
-    json(res, { error: "Sign in required." }, 401);
-    return null;
-  }
-  if (!roles.includes(user.role)) {
-    json(res, { error: "Not authorised." }, 403);
-    return null;
-  }
+async function requireRole(req: IncomingMessage, res: ServerResponse, roles: Role[]): Promise<SessionUser | null> {
+  const user = await currentUser(req);
+  if (!user) { json(res, { error: "Sign in required." }, 401); return null; }
+  if (!roles.includes(user.role)) { json(res, { error: "Not authorised." }, 403); return null; }
   return user;
 }
-function login(
-  req: IncomingMessage,
-  res: ServerResponse,
-  user: SessionUser,
-): void {
-  logActivity(user, "Signed in", "Account", String(user.id));
-  res.setHeader("Set-Cookie", sessionCookie(user.id));
-  json(res, user);
+async function login(req: IncomingMessage, res: ServerResponse, user: SessionUser): Promise<void> {
+  await logActivity(user, "Signed in", "Account", String(user.id)); res.setHeader("Set-Cookie", sessionCookie(user.id)); json(res, user);
 }
-function notify(userId: number, message: string): void {
-  database
-    .prepare(
-      "INSERT INTO notifications(recipient_id,message,created_at) VALUES(?,?,?)",
-    )
-    .run(userId, message, now());
+async function notify(userId: number, message: string): Promise<void> {
+  await database.prepare("INSERT INTO notifications(recipient_id,message,created_at) VALUES(?,?,?)").run(userId, message, now());
 }
-function assignTask(bookingId: number): void {
-  const booking = database
-    .prepare(
-      "SELECT b.*,s.name AS service,s.required_skill FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.id=?",
-    )
-    .get(bookingId) as
-    | {
-        reference: string;
-        event_date: string;
-        start_time: string;
-        service: string;
-        required_skill: string;
-      }
-    | undefined;
+async function assignTask(bookingId: number): Promise<void> {
+  const booking = await database.prepare("SELECT b.*,s.name AS service,s.required_skill FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.id=?").get(bookingId) as any;
   if (!booking) return;
-  database
-    .prepare(
-      "INSERT OR IGNORE INTO tasks(booking_id,name,required_skill,due_at) VALUES(?,?,?,?)",
-    )
-    .run(
-      bookingId,
-      `${booking.service} · event delivery`,
-      booking.required_skill,
-      `${booking.event_date}T${booking.start_time}`,
-    );
-  const task = database
-    .prepare("SELECT id,staff_id FROM tasks WHERE booking_id=?")
-    .get(bookingId) as { id: number; staff_id: number | null };
+  await database.prepare("INSERT OR IGNORE INTO tasks(booking_id,name,required_skill,due_at) VALUES(?,?,?,?)").run(bookingId, `${booking.service} · event delivery`, booking.required_skill, `${booking.event_date}T${booking.start_time}`);
+  const task = await database.prepare("SELECT id,staff_id FROM tasks WHERE booking_id=?").get(bookingId) as any;
   if (task.staff_id) return;
-  const candidates = database
-    .prepare(
-      "SELECT st.id,st.user_id FROM staff st JOIN users u ON u.id=st.user_id WHERE u.active=1 AND lower(st.skills) LIKE lower(?) ORDER BY (SELECT COUNT(*) FROM tasks WHERE staff_id=st.id AND status NOT IN ('Completed','Cancelled'))",
-    )
-    .all(`%${booking.required_skill}%`) as Array<{
-    id: number;
-    user_id: number;
-  }>;
+  const candidates = await database.prepare("SELECT st.id,st.user_id FROM staff st JOIN users u ON u.id=st.user_id WHERE u.active=1 AND lower(st.skills) LIKE lower(?) ORDER BY (SELECT COUNT(*) FROM tasks WHERE staff_id=st.id AND status NOT IN ('Completed','Cancelled'))").all(`%${booking.required_skill}%`) as any[];
   for (const staff of candidates) {
-    const conflict = database
-      .prepare(
-        "SELECT 1 FROM tasks t JOIN bookings b ON b.id=t.booking_id WHERE t.staff_id=? AND b.event_date=? AND t.status NOT IN ('Completed','Cancelled')",
-      )
-      .get(staff.id, booking.event_date);
+    const conflict = await database.prepare("SELECT 1 FROM tasks t JOIN bookings b ON b.id=t.booking_id WHERE t.staff_id=? AND b.event_date=? AND t.status NOT IN ('Completed','Cancelled')").get(staff.id, booking.event_date);
     if (conflict) continue;
-    database
-      .prepare("UPDATE tasks SET staff_id=?,status='Assigned' WHERE id=?")
-      .run(staff.id, task.id);
-    notify(
-      staff.user_id,
-      `New task assigned for booking ${booking.reference}.`,
-    );
-    database
-      .prepare("UPDATE bookings SET status='Assigned' WHERE id=?")
-      .run(bookingId);
+    await database.prepare("UPDATE tasks SET staff_id=?,status='Assigned' WHERE id=?").run(staff.id, task.id);
+    await notify(staff.user_id, `New task assigned for booking ${booking.reference}.`);
+    await database.prepare("UPDATE bookings SET status='Assigned' WHERE id=?").run(bookingId);
     return;
   }
-  for (const admin of database
-    .prepare("SELECT id FROM users WHERE role='admin'")
-    .all() as Array<{ id: number }>)
-    notify(
-      admin.id,
-      `No qualified staff is available for ${booking.reference}. Manual assignment needed.`,
-    );
+  for (const admin of await database.prepare("SELECT id FROM users WHERE role='admin'").all() as any[])
+    await notify(admin.id, `No qualified staff is available for ${booking.reference}. Manual assignment needed.`);
 }
 
 async function handleApi(
@@ -301,14 +217,14 @@ async function handleApi(
   const path = url.pathname;
   const method = req.method || "GET";
   if (method === "GET" && path === "/api/me")
-    return (json(res, currentUser(req)), true);
+    return (json(res, await currentUser(req)), true);
   if (method === "GET" && path === "/api/public") {
-    const serviceRows = database
+    const serviceRows = await database
       .prepare(
         "SELECT id,name,description,required_skill FROM services WHERE active=1 ORDER BY id",
       )
       .all();
-    const packageRows = database
+    const packageRows = await database
       .prepare("SELECT p.id,p.service_id,s.name AS service_name,p.name,p.price,p.price_from,p.duration_minutes,p.description FROM packages p JOIN services s ON s.id=p.service_id WHERE p.active=1 AND s.active=1 ORDER BY s.id,p.id")
       .all();
     return (json(res, { services: serviceRows, packages: packageRows }), true);
@@ -338,7 +254,7 @@ async function handleApi(
         true
       );
     try {
-      const result = database
+      const result = await database
         .prepare(
           "INSERT INTO users(name,email,phone,password_hash,role,created_at) VALUES(?,?,?,?,'customer',?)",
         )
@@ -349,11 +265,11 @@ async function handleApi(
           hashPassword(password),
           now(),
         );
-      const customer = database
+      const customer = await database
         .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
         .get(Number(result.lastInsertRowid)) as SessionUser;
-      logActivity(customer, "Created customer account", "Account", String(customer.id));
-      login(req, res, customer);
+      await logActivity(customer, "Created customer account", "Account", String(customer.id));
+      await login(req, res, customer);
     } catch {
       json(res, { error: "That email address is already registered." }, 409);
     }
@@ -364,7 +280,7 @@ async function handleApi(
     ["/api/login", "/api/admin/login", "/api/staff/login"].includes(path)
   ) {
     const body = await readJson(req);
-    const user = database
+    const user = await database
       .prepare("SELECT * FROM users WHERE email=? AND active=1")
       .get(String(body.email || "").trim().toLowerCase()) as
       | (SessionUser & { password_hash: string })
@@ -379,13 +295,13 @@ async function handleApi(
       !verifyPassword(String(body.password || ""), user.password_hash) ||
       (required && user.role !== required)
     ) {
-      logActivity(null, "Failed sign-in attempt", "Account", "", required || "Customer account");
+      await logActivity(null, "Failed sign-in attempt", "Account", "", required || "Customer account");
       return (
         json(res, { error: "Email or password is incorrect." }, 401),
         true
       );
     }
-    login(req, res, user);
+    await login(req, res, user);
     return true;
   }
   if (method === "POST" && path === "/api/admin/recover") {
@@ -401,20 +317,20 @@ async function handleApi(
     const password = String(body.password || "");
     if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10)
       return (json(res, { error: "Enter a name, valid email and password of at least 10 characters." }, 400), true);
-    const admins = database.prepare("SELECT id FROM users WHERE role='admin'").all() as Array<{ id: number }>;
+    const admins = await database.prepare("SELECT id FROM users WHERE role='admin'").all() as Array<{ id: number }>;
     if (admins.length !== 1)
       return (json(res, { error: admins.length === 0 ? "No administrator account exists. Use the initial setup page instead." : "There is more than one administrator account. Ask an existing administrator to update the account." }, 409), true);
     const adminId = admins[0].id;
-    const duplicate = database.prepare("SELECT 1 FROM users WHERE email=? AND id<>?").get(email, adminId);
+    const duplicate = await database.prepare("SELECT 1 FROM users WHERE email=? AND id<>?").get(email, adminId);
     if (duplicate)
       return (json(res, { error: "That email address is already registered." }, 409), true);
-    database.prepare("UPDATE users SET name=?,email=?,password_hash=? WHERE id=?")
+    await database.prepare("UPDATE users SET name=?,email=?,password_hash=? WHERE id=?")
       .run(name, email, hashPassword(password), adminId);
-    const admin = database.prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
+    const admin = await database.prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
       .get(adminId) as SessionUser;
-    logActivity(admin, "Recovered administrator login details", "Account", String(admin.id));
+    await logActivity(admin, "Recovered administrator login details", "Account", String(admin.id));
     process.env.ESCAPE_VILLA_ADMIN_RECOVERY_KEY = "";
-    login(req, res, admin);
+    await login(req, res, admin);
     return true;
   }
   if (method === "POST" && path === "/api/admin/reset-all") {
@@ -430,15 +346,15 @@ async function handleApi(
     if (!process.env.ESCAPE_VILLA_SETUP_KEY)
       return (json(res, { error: "Configure ESCAPE_VILLA_SETUP_KEY before erasing accounts, so a new administrator can be created afterward." }, 503), true);
     try {
-      database.exec("BEGIN IMMEDIATE");
-      database.exec("DELETE FROM notifications; DELETE FROM changes; DELETE FROM tasks; DELETE FROM payments; DELETE FROM bookings; DELETE FROM staff; DELETE FROM users; DELETE FROM activity_log;");
       const newSessionSecret = randomBytes(32).toString("hex");
-      database.prepare("INSERT INTO settings(key,value) VALUES('session_secret_override',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(newSessionSecret);
-      database.exec("COMMIT");
+      await database.transaction(async (tx: any) => {
+        for (const table of ["notifications", "changes", "tasks", "payments", "bookings", "staff", "users", "activity_log"])
+          await tx.prepare(`DELETE FROM ${table}`).run();
+        await tx.prepare("INSERT INTO settings(key,value) VALUES('session_secret_override',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(newSessionSecret);
+      });
       secret = newSessionSecret;
       process.env.ESCAPE_VILLA_RESET_ALL_KEY = "";
     } catch {
-      try { database.exec("ROLLBACK"); } catch { /* transaction may already be closed */ }
       return (json(res, { error: "The reset could not be completed. No partial reset was kept." }, 500), true);
     }
     res.setHeader("Set-Cookie", "ev_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
@@ -451,7 +367,7 @@ async function handleApi(
       !configured ||
       body.setup_key !== configured ||
       Number(
-        database
+        await database
           .prepare("SELECT COUNT(*) AS count FROM users WHERE role='admin'")
           .get()?.count,
       ) > 0
@@ -483,7 +399,7 @@ async function handleApi(
         ),
         true
       );
-    const result = database
+    const result = await database
       .prepare(
         "INSERT INTO users(name,email,password_hash,role,created_at) VALUES(?,?,?,'admin',?)",
       )
@@ -493,16 +409,16 @@ async function handleApi(
         hashPassword(String(body.password || "")),
         now(),
       );
-    const admin = database
+    const admin = await database
       .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
       .get(Number(result.lastInsertRowid)) as SessionUser;
-    logActivity(admin, "Created administrator account", "Account", String(admin.id));
-    login(req, res, admin);
+    await logActivity(admin, "Created administrator account", "Account", String(admin.id));
+    await login(req, res, admin);
     return true;
   }
   if (method === "POST" && path === "/api/logout") {
-    const user = currentUser(req);
-    if (user) logActivity(user, "Signed out", "Account", String(user.id));
+    const user = await currentUser(req);
+    if (user) await logActivity(user, "Signed out", "Account", String(user.id));
     res.setHeader(
       "Set-Cookie",
       "ev_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
@@ -516,21 +432,19 @@ async function handleApi(
     );
     if (vals.some((value) => !value))
       return (json(res, { error: "Complete all contact fields." }, 400), true);
-    database
-      .prepare(
-        "INSERT INTO enquiries(name,email,phone,subject,message,created_at) VALUES(?,?,?,?,?,?)",
-      )
+    const enquiryInsert = await database
+      .prepare("INSERT INTO enquiries(name,email,phone,subject,message,created_at) VALUES(?,?,?,?,?,?) RETURNING id")
       .run(...vals, now());
-    const enquiry = database.prepare("SELECT last_insert_rowid() AS id").get() as { id: number };
-    logActivity(null, "Submitted contact enquiry", "Enquiry", String(enquiry.id), vals[3]);
-    for (const admin of database
+    const enquiryId = Number(enquiryInsert.rows[0]?.id || enquiryInsert.lastInsertRowid || 0);
+    await logActivity(null, "Submitted contact enquiry", "Enquiry", String(enquiryId), vals[3]);
+    for (const admin of await database
       .prepare("SELECT id FROM users WHERE role='admin'")
       .all() as Array<{ id: number }>)
-      notify(admin.id, "A new contact enquiry has arrived.");
+      await notify(admin.id, "A new contact enquiry has arrived.");
     return (json(res, { ok: true }), true);
   }
   if (method === "PATCH" && path === "/api/admin/account") {
-    const user = requireRole(req, res, ["admin"]);
+    const user = await requireRole(req, res, ["admin"]);
     if (!user) return true;
     const body = await readJson(req);
     const name = String(body.name || "").trim();
@@ -539,36 +453,36 @@ async function handleApi(
     const newPassword = String(body.new_password || "");
     if (!name || !/^\S+@\S+\.\S+$/.test(email))
       return (json(res, { error: "Enter your name and a valid email address." }, 400), true);
-    const saved = database
+    const saved = await database
       .prepare("SELECT password_hash FROM users WHERE id=?")
       .get(user.id) as { password_hash: string } | undefined;
     if (!saved || !verifyPassword(currentPassword, saved.password_hash))
       return (json(res, { error: "Your current password is incorrect." }, 401), true);
     if (newPassword && newPassword.length < 10)
       return (json(res, { error: "Your new password must be at least 10 characters." }, 400), true);
-    const duplicate = database
+    const duplicate = await database
       .prepare("SELECT 1 FROM users WHERE email=? AND id<>?")
       .get(email, user.id);
     if (duplicate)
       return (json(res, { error: "That email address is already registered." }, 409), true);
     try {
-      database.prepare("UPDATE users SET name=?,email=? WHERE id=?").run(name, email, user.id);
+      await database.prepare("UPDATE users SET name=?,email=? WHERE id=?").run(name, email, user.id);
       if (newPassword)
-        database.prepare("UPDATE users SET password_hash=? WHERE id=?").run(hashPassword(newPassword), user.id);
+        await database.prepare("UPDATE users SET password_hash=? WHERE id=?").run(hashPassword(newPassword), user.id);
     } catch {
       return (json(res, { error: "That email address is already registered." }, 409), true);
     }
-    const updated = database
+    const updated = await database
       .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
       .get(user.id) as SessionUser;
     const changes = [email !== user.email ? "email changed" : "", newPassword ? "password changed" : ""]
       .filter(Boolean)
       .join("; ") || "name updated";
-    logActivity(updated, "Updated administrator login details", "Account", String(user.id), changes);
+    await logActivity(updated, "Updated administrator login details", "Account", String(user.id), changes);
     return (json(res, updated), true);
   }
   if (method === "PATCH" && path === "/api/customer/profile") {
-    const user = requireRole(req, res, ["customer"]);
+    const user = await requireRole(req, res, ["customer"]);
     if (!user) return true;
     const body = await readJson(req);
     const name = String(body.name || "").trim();
@@ -581,7 +495,7 @@ async function handleApi(
         json(res, { error: "Enter your name and a valid email address." }, 400),
         true
       );
-    const duplicate = database
+    const duplicate = await database
       .prepare("SELECT 1 FROM users WHERE email=? AND id<>?")
       .get(email, user.id);
     if (duplicate)
@@ -590,7 +504,7 @@ async function handleApi(
         true
       );
     if (newPassword) {
-      const saved = database
+      const saved = await database
         .prepare("SELECT password_hash FROM users WHERE id=?")
         .get(user.id) as { password_hash: string } | undefined;
       if (!saved || !verifyPassword(currentPassword, saved.password_hash))
@@ -605,11 +519,11 @@ async function handleApi(
         );
     }
     try {
-      database
+      await database
         .prepare("UPDATE users SET name=?,email=?,phone=? WHERE id=?")
         .run(name, email, phone, user.id);
       if (newPassword)
-        database
+        await database
           .prepare("UPDATE users SET password_hash=? WHERE id=?")
           .run(hashPassword(newPassword), user.id);
     } catch {
@@ -618,19 +532,19 @@ async function handleApi(
         true
       );
     }
-    const updated = database
+    const updated = await database
       .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
       .get(user.id) as SessionUser;
-    logActivity(updated, "Updated account profile", "Account", String(user.id), newPassword ? "Profile and password updated" : "Profile updated");
+    await logActivity(updated, "Updated account profile", "Account", String(user.id), newPassword ? "Profile and password updated" : "Profile updated");
     return (json(res, updated), true);
   }
   if (method === "GET" && path === "/api/customer/bookings") {
-    const user = requireRole(req, res, ["customer"]);
+    const user = await requireRole(req, res, ["customer"]);
     if (!user) return true;
     return (
       json(
         res,
-        database
+        await database
           .prepare(
             "SELECT b.*,s.name AS service,p.status AS payment_status FROM bookings b JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id WHERE b.customer_id=? ORDER BY event_date DESC",
           )
@@ -640,14 +554,14 @@ async function handleApi(
     );
   }
   if (method === "POST" && path === "/api/customer/bookings") {
-    const user = requireRole(req, res, ["customer"]);
+    const user = await requireRole(req, res, ["customer"]);
     if (!user) return true;
     const body = await readJson(req);
     const date = String(body.event_date || "");
     const time = String(body.start_time || "");
     const venue = "Escape Villa, 38 Voortrekker Street, Polokwane Central";
     const packageId = Number(body.package_id);
-    const selectedPackage = database
+    const selectedPackage = await database
       .prepare("SELECT p.id,p.service_id,p.name,p.price,p.price_from,p.duration_minutes,p.description,s.required_skill FROM packages p JOIN services s ON s.id=p.service_id WHERE p.id=? AND p.active=1 AND s.active=1")
       .get(packageId) as { id: number; service_id: number; name: string; price: number; price_from: number; duration_minutes: number | null; description: string; required_skill: string } | undefined;
     if (!selectedPackage)
@@ -685,7 +599,7 @@ async function handleApi(
     const end = new Date(`2000-01-01T${time}:00`);
     end.setMinutes(end.getMinutes() + minutes);
     const endText = `${String(end.getHours()).padStart(2, "0")}:${String(end.getMinutes()).padStart(2, "0")}`;
-    const collision = database
+    const collision = await database
       .prepare(
         "SELECT 1 FROM bookings WHERE event_date=? AND status NOT IN ('Cancelled','Declined') AND start_time < ? AND time(start_time,'+'||duration_minutes||' minutes') > ?",
       )
@@ -700,7 +614,7 @@ async function handleApi(
         true
       );
     const reference = `EV-${new Date().toISOString().slice(2, 10).replaceAll("-", "")}-${randomBytes(3).toString("hex").toUpperCase()}`;
-    const result = database
+    const result = await database
       .prepare(
         "INSERT INTO bookings(reference,customer_id,service_id,package_id,package_name,package_price,package_price_from,package_description,event_type,event_date,start_time,duration_minutes,venue,guests,details,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending Payment',?)",
       )
@@ -722,23 +636,23 @@ async function handleApi(
         String(body.details || ""),
         now(),
       );
-    database
+    await database
       .prepare("INSERT INTO payments(booking_id,status) VALUES(?,'Pending')")
       .run(Number(result.lastInsertRowid));
-    logActivity(user, "Requested appointment", "Booking", reference, `${date} ${time}; ${selectedPackage.name} (R${selectedPackage.price}${selectedPackage.price_from ? "+" : ""})`);
+    await logActivity(user, "Requested appointment", "Booking", reference, `${date} ${time}; ${selectedPackage.name} (R${selectedPackage.price}${selectedPackage.price_from ? "+" : ""})`);
     return (
       json(res, { ok: true, reference, status: "Pending Payment" }, 201),
       true
     );
   }
   if (method === "GET" && path === "/api/admin/dashboard") {
-    if (!requireRole(req, res, ["admin"])) return true;
-    const bookings = database
+    if (!await requireRole(req, res, ["admin"])) return true;
+    const bookings = await database
       .prepare(
         "SELECT b.*,u.name AS customer,s.name AS service,p.status AS payment_status FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id ORDER BY b.created_at DESC",
       )
       .all();
-    const staff = database
+    const staff = await database
       .prepare(
         "SELECT u.id,u.name,u.email FROM users u WHERE u.role='staff' AND u.active=1",
       )
@@ -746,7 +660,7 @@ async function handleApi(
     return (json(res, { bookings, staff }), true);
   }
   if (method === "POST" && path === "/api/admin/staff") {
-    if (!requireRole(req, res, ["admin"])) return true;
+    if (!await requireRole(req, res, ["admin"])) return true;
     const body = await readJson(req);
     const name = String(body.name || "").trim();
     const email = String(body.email || "").trim().toLowerCase();
@@ -763,23 +677,16 @@ async function handleApi(
         true
       );
     try {
-      database.exec("BEGIN IMMEDIATE");
-      const result = database
-        .prepare(
-          "INSERT INTO users(name,email,phone,password_hash,role,created_at) VALUES(?,?,?,?,'staff',?)",
-        )
-        .run(name, email, phone, hashPassword(password), now());
-      database
-        .prepare("INSERT INTO staff(user_id,skills) VALUES(?,?)")
-        .run(Number(result.lastInsertRowid), skills);
-      database.exec("COMMIT");
-      const staffUser = database
-        .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
-        .get(Number(result.lastInsertRowid)) as SessionUser;
-      logActivity(currentUser(req), "Created staff account", "Account", String(staffUser.id), staffUser.email);
+      const staffUser = await database.transaction(async (tx: any) => {
+        const result = await tx.prepare("INSERT INTO users(name,email,phone,password_hash,role,created_at) VALUES(?,?,?,?,'staff',?)")
+          .run(name, email, phone, hashPassword(password), now());
+        const userId = Number(result.lastInsertRowid);
+        await tx.prepare("INSERT INTO staff(user_id,skills) VALUES(?,?)").run(userId, skills);
+        return await tx.prepare("SELECT id,name,email,phone,role FROM users WHERE id=?").get(userId) as SessionUser;
+      });
+      await logActivity(await currentUser(req), "Created staff account", "Account", String(staffUser.id), staffUser.email);
       return (json(res, staffUser, 201), true);
     } catch (error) {
-      database.exec("ROLLBACK");
       if (String(error).includes("UNIQUE constraint failed: users.email"))
         return (
           json(res, { error: "That email address is already registered." }, 409),
@@ -790,7 +697,7 @@ async function handleApi(
     }
   }
   if (method === "GET" && path === "/api/admin/reports") {
-    if (!requireRole(req, res, ["admin"])) return true;
+    if (!await requireRole(req, res, ["admin"])) return true;
     const period = url.searchParams.get("period") || "daily";
     const selected =
       url.searchParams.get("date") || new Date().toISOString().slice(0, 10);
@@ -830,35 +737,35 @@ async function handleApi(
     }
     const from = startDate.toISOString().slice(0, 10);
     const until = endDate.toISOString().slice(0, 10);
-    const bookings = database
+    const bookings = await database
       .prepare(
         "SELECT b.reference,b.event_date,b.start_time,b.event_type,b.venue,b.status,b.package_name,b.package_price,b.package_price_from,u.name AS customer,u.email,s.name AS service,p.status AS payment_status,p.amount AS paid_amount FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id WHERE b.event_date>=? AND b.event_date<? ORDER BY b.event_date,b.start_time",
       )
       .all(from, until) as Array<Record<string, string | number | null>>;
-    const activity = database
+    const activity = await database
       .prepare("SELECT id,actor_name,actor_role,action,entity,entity_id,details,created_at FROM activity_log ORDER BY id DESC")
       .all();
-    const byService = database
+    const byService = await database
       .prepare(
         "SELECT s.name AS label,COUNT(*) AS count FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.event_date>=? AND b.event_date<? GROUP BY s.id ORDER BY count DESC",
       )
       .all(from, until);
-    const byStatus = database
+    const byStatus = await database
       .prepare(
         "SELECT status AS label,COUNT(*) AS count FROM bookings WHERE event_date>=? AND event_date<? GROUP BY status ORDER BY count DESC",
       )
       .all(from, until);
-    const paymentStatuses = database
+    const paymentStatuses = await database
       .prepare(
         "SELECT p.status AS label,COUNT(*) AS count FROM payments p JOIN bookings b ON b.id=p.booking_id WHERE b.event_date>=? AND b.event_date<? GROUP BY p.status ORDER BY count DESC",
       )
       .all(from, until);
-    const tasks = database
+    const tasks = await database
       .prepare(
         "SELECT t.status AS label,COUNT(*) AS count FROM tasks t JOIN bookings b ON b.id=t.booking_id WHERE b.event_date>=? AND b.event_date<? GROUP BY t.status ORDER BY count DESC",
       )
       .all(from, until);
-    const paid = database
+    const paid = await database
       .prepare(
         "SELECT COALESCE(SUM(p.amount),0) AS amount FROM payments p JOIN bookings b ON b.id=p.booking_id WHERE b.event_date>=? AND b.event_date<? AND p.status IN ('Deposit Paid','Partially Paid','Fully Paid')",
       )
@@ -872,14 +779,14 @@ async function handleApi(
       ).length,
       cancelled: bookings.filter((b) => b.status === "Cancelled").length,
       completedTasks: Number(
-        database
+        await database
           .prepare(
             "SELECT COUNT(*) AS count FROM tasks t JOIN bookings b ON b.id=t.booking_id WHERE b.event_date>=? AND b.event_date<? AND t.status='Completed'",
           )
           .get(from, until)?.count || 0,
       ),
       totalTasks: Number(
-        database
+        await database
           .prepare(
             "SELECT COUNT(*) AS count FROM tasks t JOIN bookings b ON b.id=t.booking_id WHERE b.event_date>=? AND b.event_date<?",
           )
@@ -905,12 +812,12 @@ async function handleApi(
     );
   }
   if (method === "GET" && path === "/api/staff/tasks") {
-    const user = requireRole(req, res, ["staff"]);
+    const user = await requireRole(req, res, ["staff"]);
     if (!user) return true;
     return (
       json(
         res,
-        database
+        await database
           .prepare(
             "SELECT t.*,b.reference,b.event_date,b.start_time,b.venue,s.name AS service FROM tasks t JOIN bookings b ON b.id=t.booking_id JOIN services s ON s.id=b.service_id JOIN staff st ON st.id=t.staff_id WHERE st.user_id=? ORDER BY t.due_at",
           )
@@ -920,13 +827,13 @@ async function handleApi(
     );
   }
   if (method === "PATCH" && path === "/api/staff/tasks") {
-    const user = requireRole(req, res, ["staff"]);
+    const user = await requireRole(req, res, ["staff"]);
     if (!user) return true;
     const body = await readJson(req);
     const status = String(body.status || "");
     if (!["In Progress", "Blocked", "Completed"].includes(status))
       return (json(res, { error: "Invalid task status." }, 400), true);
-    const task = database
+    const task = await database
       .prepare(
         "SELECT t.id,t.booking_id FROM tasks t JOIN staff s ON s.id=t.staff_id WHERE t.id=? AND s.user_id=?",
       )
@@ -934,27 +841,27 @@ async function handleApi(
       | { id: number; booking_id: number }
       | undefined;
     if (!task) return (json(res, { error: "Task not found." }, 404), true);
-    database
+    await database
       .prepare("UPDATE tasks SET status=?,notes=? WHERE id=?")
       .run(status, String(body.notes || ""), task.id);
-    logActivity(user, "Updated task status", "Task", String(task.id), `${status}; booking ${task.booking_id}`);
-    for (const admin of database
+    await logActivity(user, "Updated task status", "Task", String(task.id), `${status}; booking ${task.booking_id}`);
+    for (const admin of await database
       .prepare("SELECT id FROM users WHERE role='admin'")
       .all() as Array<{ id: number }>)
-      notify(admin.id, `Staff updated task ${task.id}: ${status}.`);
+      await notify(admin.id, `Staff updated task ${task.id}: ${status}.`);
     return (json(res, { ok: true }), true);
   }
   if (method === "GET" && path === "/api/admin/activity") {
-    if (!requireRole(req, res, ["admin"])) return true;
-    return (json(res, database.prepare("SELECT id,actor_name,actor_role,action,entity,entity_id,details,created_at FROM activity_log ORDER BY id DESC").all()), true);
+    if (!await requireRole(req, res, ["admin"])) return true;
+    return (json(res, await database.prepare("SELECT id,actor_name,actor_role,action,entity,entity_id,details,created_at FROM activity_log ORDER BY id DESC").all()), true);
   }
   if (method === "GET" && path === "/api/notifications") {
-    const user = requireRole(req, res, ["customer", "admin", "staff"]);
+    const user = await requireRole(req, res, ["customer", "admin", "staff"]);
     if (!user) return true;
     return (
       json(
         res,
-        database
+        await database
           .prepare(
             "SELECT * FROM notifications WHERE recipient_id=? ORDER BY id DESC LIMIT 50",
           )
@@ -964,11 +871,11 @@ async function handleApi(
     );
   }
   if (method === "GET" && path === "/api/admin/bookings") {
-    if (!requireRole(req, res, ["admin"])) return true;
+    if (!await requireRole(req, res, ["admin"])) return true;
     return (
       json(
         res,
-        database
+        await database
           .prepare(
             "SELECT b.*,u.name AS customer,s.name AS service,p.status AS payment_status FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id ORDER BY b.id DESC",
           )
@@ -978,11 +885,11 @@ async function handleApi(
     );
   }
   if (method === "POST" && path === "/api/admin/payment-review") {
-    const admin = requireRole(req, res, ["admin"]);
+    const admin = await requireRole(req, res, ["admin"]);
     if (!admin) return true;
     const body = await readJson(req);
     const bookingId = Number(body.booking_id);
-    const evidence = database
+    const evidence = await database
       .prepare("SELECT evidence_received FROM payments WHERE booking_id=?")
       .get(bookingId) as { evidence_received: number } | undefined;
     if (body.approve === true && !evidence?.evidence_received)
@@ -994,7 +901,7 @@ async function handleApi(
         ),
         true
       );
-    database
+    await database
       .prepare(
         "UPDATE payments SET status=?,rejection_reason=?,reviewed_at=? WHERE booking_id=?",
       )
@@ -1006,25 +913,25 @@ async function handleApi(
         now(),
         bookingId,
       );
-    const booking = database
+    const booking = await database
       .prepare("SELECT customer_id FROM bookings WHERE id=?")
       .get(bookingId) as { customer_id: number } | undefined;
     if (!booking)
       return (json(res, { error: "Booking not found." }, 404), true);
-    logActivity(admin, body.approve === true ? "Approved payment" : "Rejected payment", "Booking", String(bookingId), body.approve === true ? "Payment approved" : String(body.reason || "Payment rejected"));
-    database
+    await logActivity(admin, body.approve === true ? "Approved payment" : "Rejected payment", "Booking", String(bookingId), body.approve === true ? "Payment approved" : String(body.reason || "Payment rejected"));
+    await database
       .prepare("UPDATE bookings SET status=? WHERE id=?")
       .run(
         body.approve === true ? "Confirmed" : "Pending Verification",
         bookingId,
       );
-    notify(
+    await notify(
       booking.customer_id,
       body.approve === true
         ? "Payment approved; booking confirmed."
         : "Payment proof needs correction. Please resubmit.",
     );
-    if (body.approve === true) assignTask(bookingId);
+    if (body.approve === true) await assignTask(bookingId);
     return (json(res, { ok: true }), true);
   }
   if (path.startsWith("/api/")) {
