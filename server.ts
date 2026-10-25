@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, booking_id INTEGER NOT 
 CREATE TABLE IF NOT EXISTS changes(id INTEGER PRIMARY KEY, booking_id INTEGER NOT NULL REFERENCES bookings(id), customer_id INTEGER NOT NULL REFERENCES users(id), requested_json TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Pending', response TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, recipient_id INTEGER NOT NULL REFERENCES users(id), message TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS enquiries(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, subject TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY, actor_id INTEGER, actor_name TEXT NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL, entity TEXT NOT NULL, entity_id TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS activity_log_created_idx ON activity_log(created_at DESC);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 `);
 const initialServices = [
@@ -89,6 +91,10 @@ const secret =
   process.env.ESCAPE_VILLA_SECRET ||
   "development-secret-change-before-deployment";
 const now = (): string => new Date().toISOString();
+function logActivity(actor: SessionUser | null, action: string, entity: string, entityId = "", details = ""): void {
+  database.prepare("INSERT INTO activity_log(actor_id,actor_name,actor_role,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?,?,?)")
+    .run(actor?.id ?? null, actor?.name ?? "Visitor", actor?.role ?? "visitor", action, entity, entityId, details.slice(0, 500), now());
+}
 const json = (res: ServerResponse, body: unknown, status = 200): void => {
   const text = JSON.stringify(body);
   res.writeHead(status, {
@@ -175,6 +181,7 @@ function login(
   res: ServerResponse,
   user: SessionUser,
 ): void {
+  logActivity(user, "Signed in", "Account", String(user.id));
   res.setHeader("Set-Cookie", sessionCookie(user.id));
   json(res, user);
 }
@@ -311,13 +318,11 @@ async function handleApi(
           hashPassword(password),
           now(),
         );
-      login(
-        req,
-        res,
-        database
-          .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
-          .get(Number(result.lastInsertRowid)) as SessionUser,
-      );
+      const customer = database
+        .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
+        .get(Number(result.lastInsertRowid)) as SessionUser;
+      logActivity(customer, "Created customer account", "Account", String(customer.id));
+      login(req, res, customer);
     } catch {
       json(res, { error: "That email address is already registered." }, 409);
     }
@@ -342,11 +347,13 @@ async function handleApi(
       !user ||
       !verifyPassword(String(body.password || ""), user.password_hash) ||
       (required && user.role !== required)
-    )
+    ) {
+      logActivity(null, "Failed sign-in attempt", "Account", "", required || "Customer account");
       return (
         json(res, { error: "Email or password is incorrect." }, 401),
         true
       );
+    }
     login(req, res, user);
     return true;
   }
@@ -399,16 +406,16 @@ async function handleApi(
         hashPassword(String(body.password || "")),
         now(),
       );
-    login(
-      req,
-      res,
-      database
-        .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
-        .get(Number(result.lastInsertRowid)) as SessionUser,
-    );
+    const admin = database
+      .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
+      .get(Number(result.lastInsertRowid)) as SessionUser;
+    logActivity(admin, "Created administrator account", "Account", String(admin.id));
+    login(req, res, admin);
     return true;
   }
   if (method === "POST" && path === "/api/logout") {
+    const user = currentUser(req);
+    if (user) logActivity(user, "Signed out", "Account", String(user.id));
     res.setHeader(
       "Set-Cookie",
       "ev_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
@@ -427,6 +434,8 @@ async function handleApi(
         "INSERT INTO enquiries(name,email,phone,subject,message,created_at) VALUES(?,?,?,?,?,?)",
       )
       .run(...vals, now());
+    const enquiry = database.prepare("SELECT last_insert_rowid() AS id").get() as { id: number };
+    logActivity(null, "Submitted contact enquiry", "Enquiry", String(enquiry.id), vals[3]);
     for (const admin of database
       .prepare("SELECT id FROM users WHERE role='admin'")
       .all() as Array<{ id: number }>)
@@ -487,6 +496,7 @@ async function handleApi(
     const updated = database
       .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
       .get(user.id) as SessionUser;
+    logActivity(updated, "Updated account profile", "Account", String(user.id), newPassword ? "Profile and password updated" : "Profile updated");
     return (json(res, updated), true);
   }
   if (method === "GET" && path === "/api/customer/bookings") {
@@ -585,6 +595,7 @@ async function handleApi(
     database
       .prepare("INSERT INTO payments(booking_id,status) VALUES(?,'Pending')")
       .run(Number(result.lastInsertRowid));
+    logActivity(user, "Requested appointment", "Booking", reference, `${date} ${time}; service ${service}`);
     return (
       json(res, { ok: true, reference, status: "Pending Payment" }, 201),
       true
@@ -635,6 +646,7 @@ async function handleApi(
       const staffUser = database
         .prepare("SELECT id,name,email,phone,role FROM users WHERE id=?")
         .get(Number(result.lastInsertRowid)) as SessionUser;
+      logActivity(currentUser(req), "Created staff account", "Account", String(staffUser.id), staffUser.email);
       return (json(res, staffUser, 201), true);
     } catch (error) {
       database.exec("ROLLBACK");
@@ -693,6 +705,9 @@ async function handleApi(
         "SELECT b.reference,b.event_date,b.start_time,b.event_type,b.venue,b.status,u.name AS customer,u.email,s.name AS service,p.status AS payment_status,p.amount AS paid_amount FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id WHERE b.event_date>=? AND b.event_date<? ORDER BY b.event_date,b.start_time",
       )
       .all(from, until) as Array<Record<string, string | number | null>>;
+    const activity = database
+      .prepare("SELECT id,actor_name,actor_role,action,entity,entity_id,details,created_at FROM activity_log ORDER BY id DESC")
+      .all();
     const byService = database
       .prepare(
         "SELECT s.name AS label,COUNT(*) AS count FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.event_date>=? AND b.event_date<? GROUP BY s.id ORDER BY count DESC",
@@ -754,6 +769,7 @@ async function handleApi(
         paymentStatuses,
         tasks,
         bookings,
+        activity,
       }),
       true
     );
@@ -791,11 +807,16 @@ async function handleApi(
     database
       .prepare("UPDATE tasks SET status=?,notes=? WHERE id=?")
       .run(status, String(body.notes || ""), task.id);
+    logActivity(user, "Updated task status", "Task", String(task.id), `${status}; booking ${task.booking_id}`);
     for (const admin of database
       .prepare("SELECT id FROM users WHERE role='admin'")
       .all() as Array<{ id: number }>)
       notify(admin.id, `Staff updated task ${task.id}: ${status}.`);
     return (json(res, { ok: true }), true);
+  }
+  if (method === "GET" && path === "/api/admin/activity") {
+    if (!requireRole(req, res, ["admin"])) return true;
+    return (json(res, database.prepare("SELECT id,actor_name,actor_role,action,entity,entity_id,details,created_at FROM activity_log ORDER BY id DESC").all()), true);
   }
   if (method === "GET" && path === "/api/notifications") {
     const user = requireRole(req, res, ["customer", "admin", "staff"]);
@@ -860,6 +881,7 @@ async function handleApi(
       .get(bookingId) as { customer_id: number } | undefined;
     if (!booking)
       return (json(res, { error: "Booking not found." }, 404), true);
+    logActivity(admin, body.approve === true ? "Approved payment" : "Rejected payment", "Booking", String(bookingId), body.approve === true ? "Payment approved" : String(body.reason || "Payment rejected"));
     database
       .prepare("UPDATE bookings SET status=? WHERE id=?")
       .run(
