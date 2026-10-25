@@ -366,7 +366,7 @@ async function handleApi(
     const body = await readJson(req);
     const user = database
       .prepare("SELECT * FROM users WHERE email=? AND active=1")
-      .get(String(body.email || "").toLowerCase()) as
+      .get(String(body.email || "").trim().toLowerCase()) as
       | (SessionUser & { password_hash: string })
       | undefined;
     const required = path.includes("/admin/")
