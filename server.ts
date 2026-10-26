@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, ema
 CREATE TABLE IF NOT EXISTS services(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT NOT NULL, required_skill TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS packages(id INTEGER PRIMARY KEY, service_id INTEGER NOT NULL REFERENCES services(id), name TEXT NOT NULL, price REAL NOT NULL, price_from INTEGER NOT NULL DEFAULT 0, duration_minutes INTEGER, description TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, UNIQUE(service_id,name));
 CREATE TABLE IF NOT EXISTS bookings(id INTEGER PRIMARY KEY, reference TEXT UNIQUE NOT NULL, customer_id INTEGER NOT NULL REFERENCES users(id), service_id INTEGER NOT NULL REFERENCES services(id), package_id INTEGER REFERENCES packages(id), package_name TEXT NOT NULL DEFAULT '', package_price REAL, package_price_from INTEGER NOT NULL DEFAULT 0, package_description TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL DEFAULT '', event_date TEXT NOT NULL, start_time TEXT NOT NULL, duration_minutes INTEGER NOT NULL DEFAULT 60, venue TEXT NOT NULL, guests INTEGER, details TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Pending Payment', created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, booking_id INTEGER UNIQUE NOT NULL REFERENCES bookings(id), amount REAL, status TEXT NOT NULL DEFAULT 'Pending', evidence_received INTEGER NOT NULL DEFAULT 0, rejection_reason TEXT, reviewed_at TEXT);
+CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, booking_id INTEGER UNIQUE NOT NULL REFERENCES bookings(id), amount REAL, status TEXT NOT NULL DEFAULT 'Pending', evidence_received INTEGER NOT NULL DEFAULT 0, proof_data TEXT, proof_mime TEXT, proof_filename TEXT, rejection_reason TEXT, reviewed_at TEXT);
 CREATE TABLE IF NOT EXISTS staff(id INTEGER PRIMARY KEY, user_id INTEGER UNIQUE NOT NULL REFERENCES users(id), skills TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, booking_id INTEGER NOT NULL REFERENCES bookings(id), staff_id INTEGER REFERENCES staff(id), name TEXT NOT NULL, required_skill TEXT NOT NULL, due_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Unassigned', notes TEXT NOT NULL DEFAULT '', UNIQUE(booking_id,name));
 CREATE TABLE IF NOT EXISTS changes(id INTEGER PRIMARY KEY, booking_id INTEGER NOT NULL REFERENCES bookings(id), customer_id INTEGER NOT NULL REFERENCES users(id), requested_json TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Pending', response TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY, actor_id INTEGER
 CREATE INDEX IF NOT EXISTS activity_log_created_idx ON activity_log(created_at DESC);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 `);
+const paymentColumns = new Set((await database.prepare("PRAGMA table_info(payments)").all()).map((column: any) => String(column.name)));
+for (const [name, declaration] of [["proof_data", "TEXT"], ["proof_mime", "TEXT"], ["proof_filename", "TEXT"]] as const) {
+  if (!paymentColumns.has(name)) await database.exec(`ALTER TABLE payments ADD COLUMN ${name} ${declaration}`);
+}
 const bookingColumns = new Set(
   (await database.prepare("PRAGMA table_info(bookings)").all()).map((column: any) => String(column.name)),
 );
@@ -159,7 +163,7 @@ const json = (res: ServerResponse, body: unknown, status = 200): void => {
 };
 async function readJson(req: IncomingMessage): Promise<JsonObject> {
   let data = "";
-  for await (const chunk of req) { data += chunk; if (data.length > 1_000_000) throw new Error("Request body is too large."); }
+  for await (const chunk of req) { data += chunk; if (data.length > 5_000_000) throw new Error("Request body is too large. Payment proof files must be 3 MB or smaller."); }
   try { return data ? (JSON.parse(data) as JsonObject) : {}; } catch { throw new Error("Invalid JSON request."); }
 }
 const hashPassword = (password: string): string => { const salt = randomBytes(16).toString("hex"); return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`; };
@@ -557,6 +561,20 @@ async function handleApi(
     const user = await requireRole(req, res, ["customer"]);
     if (!user) return true;
     const body = await readJson(req);
+    const proof = body.payment_proof as { name?: unknown; type?: unknown; data?: unknown } | undefined;
+    const allowedProofTypes = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
+    const proofMatch = typeof proof?.data === "string" ? proof.data.match(/^data:([^;]+);base64,([A-Za-z0-9+/=]+)$/) : null;
+    if (!proof || !proofMatch || !allowedProofTypes.includes(proofMatch[1]))
+      return (json(res, { error: "Upload your proof of payment as a JPG, PNG, WebP or PDF file." }, 400), true);
+    const proofBytes = Buffer.from(proofMatch[2], "base64");
+    if (!proofBytes.length || proofBytes.length > 3 * 1024 * 1024 || proofBytes.toString("base64") !== proofMatch[2])
+      return (json(res, { error: "Payment proof must be a valid file no larger than 3 MB." }, 400), true);
+    const proofName = String(proof.name || "proof-of-payment").replaceAll("/", "_").replaceAll("\\", "_").replace(/[\0-\x1f]/g, "_").slice(0, 120);
+    const signatureIsValid = proofMatch[1] === "image/jpeg" ? proofBytes[0] === 0xff && proofBytes[1] === 0xd8 && proofBytes[2] === 0xff
+      : proofMatch[1] === "image/png" ? proofBytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      : proofMatch[1] === "image/webp" ? proofBytes.toString("ascii", 0, 4) === "RIFF" && proofBytes.toString("ascii", 8, 12) === "WEBP"
+      : proofBytes.toString("ascii", 0, 5) === "%PDF-";
+    if (!signatureIsValid) return (json(res, { error: "The selected file does not match its file type." }, 400), true);
     const date = String(body.event_date || "");
     const time = String(body.start_time || "");
     const venue = "Escape Villa, 38 Voortrekker Street, Polokwane Central";
@@ -614,32 +632,15 @@ async function handleApi(
         true
       );
     const reference = `EV-${new Date().toISOString().slice(2, 10).replaceAll("-", "")}-${randomBytes(3).toString("hex").toUpperCase()}`;
-    const result = await database
-      .prepare(
-        "INSERT INTO bookings(reference,customer_id,service_id,package_id,package_name,package_price,package_price_from,package_description,event_type,event_date,start_time,duration_minutes,venue,guests,details,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending Payment',?)",
-      )
-      .run(
-        reference,
-        user.id,
-        service,
-        selectedPackage.id,
-        selectedPackage.name,
-        selectedPackage.price,
-        selectedPackage.price_from,
-        selectedPackage.description,
-        String(body.event_type || ""),
-        date,
-        time,
-        minutes,
-        venue,
-        guestCount,
-        String(body.details || ""),
-        now(),
-      );
-    await database
-      .prepare("INSERT INTO payments(booking_id,status) VALUES(?,'Pending')")
-      .run(Number(result.lastInsertRowid));
-    await logActivity(user, "Requested appointment", "Booking", reference, `${date} ${time}; ${selectedPackage.name} (R${selectedPackage.price}${selectedPackage.price_from ? "+" : ""})`);
+    const bookingId = await database.transaction(async (tx: any) => {
+      const result = await tx.prepare("INSERT INTO bookings(reference,customer_id,service_id,package_id,package_name,package_price,package_price_from,package_description,event_type,event_date,start_time,duration_minutes,venue,guests,details,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending Payment',?)")
+        .run(reference, user.id, service, selectedPackage.id, selectedPackage.name, selectedPackage.price, selectedPackage.price_from, selectedPackage.description, String(body.event_type || ""), date, time, minutes, venue, guestCount, String(body.details || ""), now());
+      const id = Number(result.lastInsertRowid);
+      await tx.prepare("INSERT INTO payments(booking_id,status,evidence_received,proof_data,proof_mime,proof_filename) VALUES(?,'Pending',1,?,?,?)")
+        .run(id, proofMatch[2], proofMatch[1], proofName);
+      return id;
+    });
+    await logActivity(user, "Submitted service booking with payment proof", "Booking", reference, `${date} ${time}; ${selectedPackage.name} (R${selectedPackage.price}${selectedPackage.price_from ? "+" : ""})`);
     return (
       json(res, { ok: true, reference, status: "Pending Payment" }, 201),
       true
@@ -649,7 +650,7 @@ async function handleApi(
     if (!await requireRole(req, res, ["admin"])) return true;
     const bookings = await database
       .prepare(
-        "SELECT b.*,u.name AS customer,s.name AS service,p.status AS payment_status FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id ORDER BY b.created_at DESC",
+        "SELECT b.*,u.name AS customer,s.name AS service,p.status AS payment_status,p.evidence_received FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id LEFT JOIN payments p ON p.booking_id=b.id ORDER BY b.created_at DESC",
       )
       .all();
     const staff = await database
@@ -883,6 +884,19 @@ async function handleApi(
       ),
       true
     );
+  }
+  const paymentProofMatch = path.match(/^\/api\/admin\/payment-proof\/(\d+)$/);
+  if (method === "GET" && paymentProofMatch) {
+    if (!await requireRole(req, res, ["admin"])) return true;
+    const proof = await database.prepare("SELECT proof_data,proof_mime,proof_filename FROM payments WHERE booking_id=? AND evidence_received=1").get(Number(paymentProofMatch[1])) as any;
+    if (!proof?.proof_data || !["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(proof.proof_mime)) {
+      json(res, { error: "Payment proof was not found." }, 404);
+      return true;
+    }
+    const file = Buffer.from(proof.proof_data, "base64");
+    res.writeHead(200, { "Content-Type": proof.proof_mime, "Content-Length": file.length, "Content-Disposition": `attachment; filename="${String(proof.proof_filename || "payment-proof").replaceAll("\\", "_").replace(/[\"\r\n]/g, "_")}"`, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
+    res.end(file);
+    return true;
   }
   if (method === "POST" && path === "/api/admin/payment-review") {
     const admin = await requireRole(req, res, ["admin"]);
