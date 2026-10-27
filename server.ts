@@ -194,23 +194,39 @@ async function login(req: IncomingMessage, res: ServerResponse, user: SessionUse
 async function notify(userId: number, message: string): Promise<void> {
   await database.prepare("INSERT INTO notifications(recipient_id,message,created_at) VALUES(?,?,?)").run(userId, message, now());
 }
-async function assignTask(bookingId: number): Promise<void> {
+async function assignTask(bookingId: number): Promise<boolean> {
   const booking = await database.prepare("SELECT b.*,s.name AS service,s.required_skill FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.id=?").get(bookingId) as any;
-  if (!booking) return;
+  if (!booking) return false;
   await database.prepare("INSERT OR IGNORE INTO tasks(booking_id,name,required_skill,due_at) VALUES(?,?,?,?)").run(bookingId, `${booking.service} · event delivery`, booking.required_skill, `${booking.event_date}T${booking.start_time}`);
   const task = await database.prepare("SELECT id,staff_id FROM tasks WHERE booking_id=?").get(bookingId) as any;
-  if (task.staff_id) return;
+  if (task.staff_id) return true;
   const candidates = await database.prepare("SELECT st.id,st.user_id FROM staff st JOIN users u ON u.id=st.user_id WHERE u.active=1 AND lower(st.skills) LIKE lower(?) ORDER BY (SELECT COUNT(*) FROM tasks WHERE staff_id=st.id AND status NOT IN ('Completed','Cancelled'))").all(`%${booking.required_skill}%`) as any[];
   for (const staff of candidates) {
     const conflict = await database.prepare("SELECT 1 FROM tasks t JOIN bookings b ON b.id=t.booking_id WHERE t.staff_id=? AND b.event_date=? AND t.status NOT IN ('Completed','Cancelled')").get(staff.id, booking.event_date);
     if (conflict) continue;
     await database.prepare("UPDATE tasks SET staff_id=?,status='Assigned' WHERE id=?").run(staff.id, task.id);
     await notify(staff.user_id, `New task assigned for booking ${booking.reference}.`);
-    await database.prepare("UPDATE bookings SET status='Assigned' WHERE id=?").run(bookingId);
-    return;
+    return true;
   }
   for (const admin of await database.prepare("SELECT id FROM users WHERE role='admin'").all() as any[])
     await notify(admin.id, `No qualified staff is available for ${booking.reference}. Manual assignment needed.`);
+  return false;
+}
+async function sendBookingApprovalEmail(to: string, customerName: string, reference: string, service: string, packageName: string, eventDate: string, startTime: string): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.ESCAPE_VILLA_EMAIL_FROM;
+  if (!apiKey || !from) throw new Error("Email delivery is not configured. Set RESEND_API_KEY and ESCAPE_VILLA_EMAIL_FROM.");
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "Idempotency-Key": `booking-approved-${reference}` },
+    body: JSON.stringify({
+      from,
+      to: [to],
+      subject: `Your Escape Villa booking is approved · ${reference}`,
+      text: `Hello ${customerName},\n\nYour booking has been approved.\n\nReference: ${reference}\nService: ${service}\nPackage: ${packageName || "Not specified"}\nDate: ${eventDate}\nTime: ${startTime}\n\nThe Escape Villa team will contact you if any further details are needed.\n\nEscape Villa SA`,
+    }),
+  });
+  if (!response.ok) throw new Error(`Email provider returned ${response.status}.`);
 }
 
 async function handleApi(
@@ -773,7 +789,7 @@ async function handleApi(
     const summary = {
       totalBookings: bookings.length,
       confirmed: bookings.filter((b) =>
-        ["Confirmed", "Assigned", "In Progress", "Completed"].includes(
+        ["Confirmed", "Booking approved", "Assigned", "In Progress", "Completed"].includes(
           String(b.status),
         ),
       ).length,
@@ -906,46 +922,44 @@ async function handleApi(
       .prepare("SELECT evidence_received FROM payments WHERE booking_id=?")
       .get(bookingId) as { evidence_received: number } | undefined;
     if (body.approve === true && !evidence?.evidence_received)
-      return (
-        json(
-          res,
-          { error: "Payment evidence must be recorded before approval." },
-          400,
-        ),
-        true
-      );
+      return (json(res, { error: "Payment evidence must be recorded before approval." }, 400), true);
+    const booking = await database
+      .prepare("SELECT b.customer_id,b.reference,b.event_date,b.start_time,b.package_name,u.name AS customer_name,u.email AS customer_email,s.name AS service FROM bookings b JOIN users u ON u.id=b.customer_id JOIN services s ON s.id=b.service_id WHERE b.id=?")
+      .get(bookingId) as { customer_id: number; reference: string; event_date: string; start_time: string; package_name: string; customer_name: string; customer_email: string; service: string } | undefined;
+    if (!booking) return (json(res, { error: "Booking not found." }, 404), true);
     await database
-      .prepare(
-        "UPDATE payments SET status=?,rejection_reason=?,reviewed_at=? WHERE booking_id=?",
-      )
+      .prepare("UPDATE payments SET status=?,rejection_reason=?,reviewed_at=? WHERE booking_id=?")
       .run(
         body.approve === true ? "Deposit Paid" : "Rejected",
-        body.approve === true
-          ? null
-          : String(body.reason || "Please submit corrected proof."),
+        body.approve === true ? null : String(body.reason || "Please submit corrected proof."),
         now(),
         bookingId,
       );
-    const booking = await database
-      .prepare("SELECT customer_id FROM bookings WHERE id=?")
-      .get(bookingId) as { customer_id: number } | undefined;
-    if (!booking)
-      return (json(res, { error: "Booking not found." }, 404), true);
     await logActivity(admin, body.approve === true ? "Approved payment" : "Rejected payment", "Booking", String(bookingId), body.approve === true ? "Payment approved" : String(body.reason || "Payment rejected"));
     await database
       .prepare("UPDATE bookings SET status=? WHERE id=?")
-      .run(
-        body.approve === true ? "Confirmed" : "Pending Verification",
-        bookingId,
-      );
+      .run(body.approve === true ? "Booking approved" : "Pending Verification", bookingId);
+    if (body.approve !== true) {
+      await notify(booking.customer_id, "Payment proof needs correction. Please resubmit.");
+      return (json(res, { ok: true, emailSent: false }), true);
+    }
+    const staffAssigned = await assignTask(bookingId);
     await notify(
       booking.customer_id,
-      body.approve === true
-        ? "Payment approved; booking confirmed."
-        : "Payment proof needs correction. Please resubmit.",
+      staffAssigned
+        ? "Your booking is approved and a staff member has been assigned."
+        : "Your booking is approved. The team will arrange staff and contact you if needed.",
     );
-    if (body.approve === true) await assignTask(bookingId);
-    return (json(res, { ok: true }), true);
+    let emailSent = false;
+    let emailMessage = "";
+    try {
+      await sendBookingApprovalEmail(booking.customer_email, booking.customer_name, booking.reference, booking.service, booking.package_name, booking.event_date, booking.start_time);
+      emailSent = true;
+    } catch (error) {
+      emailMessage = error instanceof Error ? error.message : "Email delivery failed.";
+      await logActivity(admin, "Booking approval email failed", "Booking", String(bookingId), emailMessage);
+    }
+    return (json(res, { ok: true, staffAssigned, emailSent, emailMessage }), true);
   }
   if (path.startsWith("/api/")) {
     json(res, { error: "Not found." }, 404);

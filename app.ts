@@ -103,7 +103,7 @@ async function renderPortal(): Promise<void> {
       return;
     }
     const activity = await request<Activity[]>('/api/admin/activity');
-    app!.innerHTML = page('Administration', 'Booking activity and a record of actions across the site.', `<div class="metrics"><div><small>BOOKINGS</small><b>${data.bookings.length}</b></div><div><small>ACTIVE STAFF</small><b>${data.staff.length}</b></div><div><small>PENDING</small><b>${data.bookings.filter((b) => b.status.startsWith('Pending')).length}</b></div></div><p><a class="button" href="/admin/settings">Admin & staff settings</a></p><h2 class="serif">Recent activity</h2><div class="table-wrap"><table><thead><tr><th>When</th><th>Who</th><th>Activity</th><th>Record</th><th>Details</th></tr></thead><tbody>${activity.slice(0,10).map((entry)=>`<tr><td>${escapeHtml(new Date(entry.created_at).toLocaleString())}</td><td>${escapeHtml(entry.actor_name)} (${escapeHtml(entry.actor_role)})</td><td>${escapeHtml(entry.action)}</td><td>${escapeHtml(entry.entity)} ${escapeHtml(entry.entity_id)}</td><td>${escapeHtml(entry.details||'—')}</td></tr>`).join('')||'<tr><td colspan="5">No activity has been recorded yet.</td></tr>'}</tbody></table></div><p><a class="button" href="/admin/reports#activity">View full activity report</a></p><h2 class="serif">Bookings</h2><div class="table-wrap"><table><thead><tr><th>Reference</th><th>Customer</th><th>Service and package</th><th>Event date</th><th>Status</th><th>Payment proof</th></tr></thead><tbody>${data.bookings.map((b) => `<tr><td>${escapeHtml(b.reference)}</td><td>${escapeHtml((b as Booking & { customer: string }).customer)}</td><td>${escapeHtml(b.service)}<br>${escapeHtml(b.package_name || '—')}${b.package_price != null ? ` · ${packagePriceLabel({ price: b.package_price, price_from: b.package_price_from || 0 })}` : ''}</td><td>${escapeHtml(b.event_date)} ${escapeHtml(b.start_time)}</td><td>${escapeHtml(b.status)}</td><td>${b.evidence_received ? `<a href="/api/admin/payment-proof/${b.id}" target="_blank" rel="noopener noreferrer">View proof</a>` : 'Not uploaded'}</td></tr>`).join('') || '<tr><td colspan="6">No booking records yet.</td></tr>'}</tbody></table></div>`);
+    app!.innerHTML = page('Administration', 'Booking activity and a record of actions across the site.', `<div class="metrics"><div><small>BOOKINGS</small><b>${data.bookings.length}</b></div><div><small>ACTIVE STAFF</small><b>${data.staff.length}</b></div><div><small>PENDING</small><b>${data.bookings.filter((b) => b.status.startsWith('Pending')).length}</b></div></div><p><a class="button" href="/admin/settings">Admin & staff settings</a></p><h2 class="serif">Recent activity</h2><div class="table-wrap"><table><thead><tr><th>When</th><th>Who</th><th>Activity</th><th>Record</th><th>Details</th></tr></thead><tbody>${activity.slice(0,10).map((entry)=>`<tr><td>${escapeHtml(new Date(entry.created_at).toLocaleString())}</td><td>${escapeHtml(entry.actor_name)} (${escapeHtml(entry.actor_role)})</td><td>${escapeHtml(entry.action)}</td><td>${escapeHtml(entry.entity)} ${escapeHtml(entry.entity_id)}</td><td>${escapeHtml(entry.details||'—')}</td></tr>`).join('')||'<tr><td colspan="5">No activity has been recorded yet.</td></tr>'}</tbody></table></div><p><a class="button" href="/admin/reports#activity">View full activity report</a></p><h2 class="serif">Bookings</h2><div class="table-wrap"><table><thead><tr><th>Reference</th><th>Customer</th><th>Service and package</th><th>Event date</th><th>Status</th><th>Payment proof</th><th>Review</th></tr></thead><tbody>${data.bookings.map((b) => `<tr><td>${escapeHtml(b.reference)}</td><td>${escapeHtml((b as Booking & { customer: string }).customer)}</td><td>${escapeHtml(b.service)}<br>${escapeHtml(b.package_name || '—')}${b.package_price != null ? ` · ${packagePriceLabel({ price: b.package_price, price_from: b.package_price_from || 0 })}` : ''}</td><td>${escapeHtml(b.event_date)} ${escapeHtml(b.start_time)}</td><td>${escapeHtml(b.status)}</td><td>${b.evidence_received ? `<a href="/api/admin/payment-proof/${b.id}" target="_blank" rel="noopener noreferrer">View proof</a>` : 'Not uploaded'}</td><td>${b.evidence_received && b.payment_status === 'Pending' ? `<button class="button" type="button" data-payment-review="${b.id}" data-approve="true">Approve</button> <button class="button button-secondary" type="button" data-payment-review="${b.id}" data-approve="false">Reject</button>` : escapeHtml(b.payment_status || 'Awaiting proof')}</td></tr>`).join('') || '<tr><td colspan="7">No booking records yet.</td></tr>'}</tbody></table></div>`);
   } else {
     if (location.pathname === '/staff/settings') {
       app!.innerHTML = page('Staff settings', 'Manage your staff portal session.', `<p><a class="text-link" href="/staff/dashboard">← Back to your tasks</a></p><h2 class="serif">Account</h2><p class="copy">Signed in as ${escapeHtml(currentUser.name)} (${escapeHtml(currentUser.email)}).</p><button class="button" type="button" data-logout>Log out</button>`);
@@ -205,6 +205,32 @@ function bind(): void {
     } catch (error) { alert(error instanceof Error ? error.message : 'Please try again.'); }
   }));
   document.querySelectorAll<HTMLButtonElement>('[data-task]').forEach((button) => button.addEventListener('click', async () => { try { await request('/api/staff/tasks', { method: 'PATCH', body: JSON.stringify({ task_id: Number(button.dataset.task), status: 'In Progress' }) }); await route(); } catch (error) { alert(error instanceof Error ? error.message : 'Could not update task.'); } }));
+  document.querySelectorAll<HTMLButtonElement>('[data-payment-review]').forEach((button) => button.addEventListener('click', async () => {
+    const approve = button.dataset.approve === 'true';
+    if (!approve && !window.confirm('Reject this payment proof? The customer will see that it needs correction.')) return;
+    button.disabled = true;
+    try {
+      const result = await request<{ emailSent: boolean; emailMessage?: string; staffAssigned: boolean }>('/api/admin/payment-review', {
+        method: 'POST',
+        body: JSON.stringify({ booking_id: Number(button.dataset.paymentReview), approve }),
+      });
+      if (approve) {
+        const assignmentMessage = result.staffAssigned
+          ? 'A staff member was assigned.'
+          : 'No available qualified staff member was found; please follow up with the team.';
+        const emailMessage = result.emailSent
+          ? 'The customer approval email was sent.'
+          : `The customer email was not sent: ${result.emailMessage || 'email provider is not configured.'}`;
+        alert(`Booking approved. ${assignmentMessage} ${emailMessage}`);
+      } else {
+        alert('Payment proof rejected.');
+      }
+      await route();
+    } catch (error) {
+      button.disabled = false;
+      alert(error instanceof Error ? error.message : 'Could not review this booking.');
+    }
+  }));
   document.querySelectorAll<HTMLButtonElement>('[data-logout]').forEach((button) => button.addEventListener('click', async () => { try { await request('/api/logout', { method: 'POST' }); currentUser = null; history.pushState({}, '', '/'); await route(); } catch (error) { alert(error instanceof Error ? error.message : 'Could not sign out.'); } }));
 }
 window.addEventListener('popstate', () => { void route(); });
