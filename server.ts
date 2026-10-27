@@ -670,18 +670,32 @@ async function handleApi(
       .all();
     const staff = await database
       .prepare(
-        "SELECT u.id,u.name,u.email FROM users u WHERE u.role='staff' AND u.active=1",
+        "SELECT u.id,u.name,u.email,st.skills FROM users u JOIN staff st ON st.user_id=u.id WHERE u.role='staff' AND u.active=1 ORDER BY u.name",
       )
       .all();
     return (json(res, { bookings, staff }), true);
   }
-  if (method === "POST" && path === "/api/admin/staff") {
-    if (!await requireRole(req, res, ["admin"])) return true;
+  if ((method === "POST" || method === "PATCH") && path === "/api/admin/staff") {
+    const admin = await requireRole(req, res, ["admin"]);
+    if (!admin) return true;
     const body = await readJson(req);
+    const selectedSkills = Array.isArray(body.skills)
+      ? body.skills.map((skill) => String(skill).trim()).filter(Boolean)
+      : String(body.skills || "").split(",").map((skill) => skill.trim()).filter(Boolean);
+    const allowedSkills = (await database.prepare("SELECT required_skill FROM services WHERE active=1").all() as Array<{ required_skill: string }>).map((service) => service.required_skill);
+    const skills = [...new Set(selectedSkills.filter((skill) => allowedSkills.includes(skill)))].join(", ");
+    if (!skills) return (json(res, { error: "Select at least one active service for this staff member." }, 400), true);
+    if (method === "PATCH") {
+      const staffUserId = Number(body.staff_user_id);
+      const staffUser = await database.prepare("SELECT id,name,email,role FROM users WHERE id=? AND role='staff' AND active=1").get(staffUserId) as SessionUser | undefined;
+      if (!staffUser) return (json(res, { error: "Active staff account not found." }, 404), true);
+      await database.prepare("UPDATE staff SET skills=? WHERE user_id=?").run(skills, staffUserId);
+      await logActivity(admin, "Updated staff services", "Account", String(staffUserId), skills);
+      return (json(res, { ok: true }), true);
+    }
     const name = String(body.name || "").trim();
     const email = String(body.email || "").trim().toLowerCase();
     const phone = String(body.phone || "").trim();
-    const skills = String(body.skills || "").trim().slice(0, 500);
     const password = String(body.password || "");
     if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10)
       return (
@@ -700,7 +714,7 @@ async function handleApi(
         await tx.prepare("INSERT INTO staff(user_id,skills) VALUES(?,?)").run(userId, skills);
         return await tx.prepare("SELECT id,name,email,phone,role FROM users WHERE id=?").get(userId) as SessionUser;
       });
-      await logActivity(await currentUser(req), "Created staff account", "Account", String(staffUser.id), staffUser.email);
+      await logActivity(admin, "Created staff account", "Account", String(staffUser.id), `${staffUser.email}; services: ${skills}`);
       return (json(res, staffUser, 201), true);
     } catch (error) {
       if (String(error).includes("UNIQUE constraint failed: users.email"))
