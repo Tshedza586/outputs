@@ -243,15 +243,14 @@ async function handleApi(
     if (
       !name ||
       !/^\S+@\S+\.\S+$/.test(email) ||
-      password.length < 10 ||
-      body.privacy !== true
+      password.length < 10
     )
       return (
         json(
           res,
           {
             error:
-              "Name, valid email, 10-character password and privacy acceptance are required.",
+              "Name, valid email and a 10-character password are required.",
           },
           400,
         ),
